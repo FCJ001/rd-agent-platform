@@ -1,0 +1,63 @@
+# ============================================================
+# rd-agent-platform 依赖
+#
+# 分组按落地步骤：步 1 只需要「Web + 配置 + DB + 测试」四组，
+# 但一次装齐避免后面反复 pip install。
+# 版本对齐 tiangong-agent（已跑通的组合），不要随意升级 ——
+# langchain / langgraph 系列版本互相绑定，混搭会出 import 错误
+# ============================================================
+
+# ---------------- Web 框架（步 1）----------------
+fastapi==0.135.1
+uvicorn==0.42.0
+python-multipart==0.0.22
+sse-starlette==3.3.4
+
+# ---------------- 配置与日志（步 1）----------------
+pydantic==2.12.5
+pydantic-settings==2.13.1
+python-dotenv==1.2.2
+loguru==0.7.3
+
+# ---------------- PostgreSQL（步 1）----------------
+SQLAlchemy==2.0.48
+asyncpg==0.30.0
+greenlet==3.3.2
+alembic==1.18.4
+# 种子脚本用同步驱动，业务代码用 asyncpg
+psycopg2-binary==2.9.11
+
+# ---------------- 测试（步 1）----------------
+pytest==9.0.2
+pytest-asyncio==1.3.0
+httpx==0.28.1
+
+# ---------------- Neo4j（步 3）----------------
+neo4j==5.28.2
+
+# ---------------- Milvus（步 4）----------------
+pymilvus==2.6.10
+
+# ---------------- Redis Stack（步 5）----------------
+redis==7.3.0
+redisvl==0.17.0
+langgraph-checkpoint-redis==0.4.0
+
+# ---------------- LangChain / LangGraph（步 4-5）----------------
+langchain==1.2.15
+langchain-core==1.2.28
+langchain-community==0.4.1
+langchain-openai==1.1.12
+langchain-deepseek==1.0.1
+langgraph==1.1.6
+langgraph-checkpoint==4.0.1
+langgraph-prebuilt==1.0.9
+dashscope==1.25.16
+
+# ---------------- MinIO + 报告解析（步 6）----------------
+minio==7.2.18
+pypdf==6.10.0
+pandas==2.3.3
+
+# ---------------- 跨服务调项目二（步 7）----------------
+# httpx 已在测试组

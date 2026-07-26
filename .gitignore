@@ -1,0 +1,30 @@
+# 环境与密钥
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docker 数据卷（bind mount，绝不入库）
+docker/
+
+# 日志
+logs/
+*.log
+
+# 生成的数据（download_datasets.py / gen_alm_kg.py 的产物，可重跑）
+data/raw/
+data/eval/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
