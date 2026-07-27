@@ -68,10 +68,12 @@ def import_kg(driver):
             s.run(
                 """MERGE (rc:RootCause {code: $code})
                    SET rc.name = $name, rc.domain = $domain, rc.business_line = $line,
-                       rc.description = $desc, rc.fix_way = $fix_way, rc.fix_duration = $fix_duration""",
+                       rc.description = $desc, rc.fix_way = $fix_way, rc.fix_duration = $fix_duration,
+                       rc.dtc = $dtc""",
                 code=c["code"], name=c["name"], domain=c.get("domain"), line=c.get("business_line"),
                 desc=c.get("description", ""), fix_way=c.get("fix_way", ""),
                 fix_duration=c.get("fix_duration", ""),
+                dtc=c.get("dtc", []),
             )
             cause_count += 1
 

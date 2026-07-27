@@ -1,0 +1,83 @@
+"""分诊 API Router。POST /api/v1/triage"""
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
+
+from src.agents.workers.triage_agent import get_triage_agent
+from src.core.base_schema import ResponseSchema
+from src.core.logger import logger
+
+router = APIRouter(prefix="/api/v1/triage", tags=["分诊诊断"])
+
+
+# ── 请求体 ──
+class TriageRequest(BaseModel):
+    raw_input: str = Field(..., description="故障描述（口语），如'车机偶尔黑屏'")
+    session_id: str | None = Field(None, description="继续追问时传入上次返回的 session_id")
+    issue_id: int | None = Field(None, description="关联问题单 ID")
+
+
+# ── 响应体 ──
+class CandidateCauseOut(BaseModel):
+    code: str
+    name: str
+    domain: str
+    confidence: float
+    base_confidence: float
+    matched_phenomena: list[str]
+    all_phenomena: list[str]
+    fix_way: str
+    fix_duration: str
+    verify_items: str
+    is_core_match: bool
+    dtc_matched: list[str]
+
+
+class TriageResult(BaseModel):
+    session_id: str
+    status: str = Field(..., description="converged | asking | max_turns")
+    round: int
+    normalized_phenomena: list[str]
+    candidate_causes: list[CandidateCauseOut]
+    confidence: float
+    follow_up_questions: list[str]
+    diagnostic_summary: str
+
+
+@router.post("", response_model=ResponseSchema[TriageResult])
+async def triage(req: TriageRequest):
+    """
+    分诊诊断接口。
+
+    输入一句故障描述（如"车机偶尔黑屏"），返回：
+    - 规范化后的现象名
+    - 候选根因列表（按置信度降序）
+    - 如置信度不足，返回追问问题，前端可继续调用本接口传入 session_id 继续对话
+    """
+    logger.info(f"[TRIAGE] session={req.session_id or 'new'} input={req.raw_input[:80]}")
+
+    agent = get_triage_agent()
+    result = await agent.diagnose(
+        raw_input=req.raw_input,
+        session_id=req.session_id,
+        issue_id=req.issue_id,
+    )
+
+    triage_result = TriageResult(
+        session_id=result["session_id"],
+        status=result["status"],
+        round=result["round"],
+        normalized_phenomena=result["normalized_phenomena"],
+        candidate_causes=[CandidateCauseOut(**c) for c in result["candidate_causes"]],
+        confidence=result["confidence"],
+        follow_up_questions=result["follow_up_questions"],
+        diagnostic_summary=result["diagnostic_summary"],
+    )
+
+    logger.info(
+        f"[TRIAGE] session={triage_result.session_id} "
+        f"status={triage_result.status} round={triage_result.round} "
+        f"confidence={triage_result.confidence:.3f} candidates={len(triage_result.candidate_causes)}"
+    )
+
+    return ResponseSchema(data=triage_result)
