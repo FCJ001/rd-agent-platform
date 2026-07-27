@@ -69,7 +69,7 @@ async def create_supervisor_agent():
     # Milvus Store（长期记忆）
     from langchain_community.embeddings import DashScopeEmbeddings
     milvus_alias = get_milvus_client_alias()
-    embedding_model = DashScopeEmbeddings(model="text-embedding-v3")
+    embedding_model = DashScopeEmbeddings(model="text-embedding-v3", dashscope_api_key=settings.DASHSCOPE_API_KEY)
     store = MilvusStore(alias=milvus_alias, embeddings=embedding_model, dims=1024)
 
     # LLM（使用 DashScope qwen-max，与分诊 LLM 一致）

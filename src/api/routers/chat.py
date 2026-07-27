@@ -11,6 +11,7 @@ from src.agents.supervisor_agent import get_supervisor_agent, UserContext
 from src.agents.triage.graph import run_triage, TriageDeps, load_phenomenon_vocabulary
 from src.agents.triage.state import TriageState, TriagePhase
 from src.core.base_schema import ResponseSchema
+from src.core.config import get_settings
 from src.core.logger import logger
 from src.infra.redis_cache import get_checkpointer_redis
 from src.infra.milvus_client import get_milvus_client_alias
@@ -37,8 +38,9 @@ _milvus_store = None
 def _get_milvus_store() -> MilvusStore:
     global _milvus_store
     if _milvus_store is None:
+        s = get_settings()
         alias = get_milvus_client_alias()
-        embedding_model = DashScopeEmbeddings(model="text-embedding-v3")
+        embedding_model = DashScopeEmbeddings(model="text-embedding-v3", dashscope_api_key=s.DASHSCOPE_API_KEY)
         _milvus_store = MilvusStore(alias=alias, embeddings=embedding_model, dims=1024)
     return _milvus_store
 
