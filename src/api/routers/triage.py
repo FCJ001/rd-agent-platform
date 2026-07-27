@@ -1,11 +1,12 @@
 """分诊 API Router。POST /api/v1/triage"""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from src.agents.workers.triage_agent import get_triage_agent
 from src.core.base_schema import ResponseSchema
 from src.core.logger import logger
+from src.infra.redis_cache import get_checkpointer_redis
 
 router = APIRouter(prefix="/api/v1/triage", tags=["分诊诊断"])
 
@@ -47,7 +48,7 @@ class TriageResult(BaseModel):
 @router.post("", response_model=ResponseSchema[TriageResult])
 async def triage(req: TriageRequest):
     """
-    分诊诊断接口。
+    分诊诊断接口。向后兼容：支持多轮追问（通过 Redis 持久化会话状态）。
 
     输入一句故障描述（如"车机偶尔黑屏"），返回：
     - 规范化后的现象名
@@ -56,12 +57,30 @@ async def triage(req: TriageRequest):
     """
     logger.info(f"[TRIAGE] session={req.session_id or 'new'} input={req.raw_input[:80]}")
 
+    # 从 Redis 恢复上一轮状态（如有）
+    existing_state = None
+    if req.session_id:
+        redis = get_checkpointer_redis()
+        state_key = f"triage_state:{req.session_id}"
+        raw = await redis.get(state_key)
+        if raw:
+            import json
+            existing_state = json.loads(raw)
+
     agent = get_triage_agent()
     result = await agent.diagnose(
         raw_input=req.raw_input,
         session_id=req.session_id,
         issue_id=req.issue_id,
+        existing_state=existing_state,
     )
+
+    # 如果未收敛，将状态写入 Redis 供下一轮使用
+    if result["status"] == "asking" and result["_state"]:
+        redis = get_checkpointer_redis()
+        state_key = f"triage_state:{result['session_id']}"
+        import json
+        await redis.set(state_key, json.dumps(result["_state"]), ex=3600)
 
     triage_result = TriageResult(
         session_id=result["session_id"],

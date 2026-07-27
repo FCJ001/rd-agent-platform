@@ -75,8 +75,8 @@ def check_convergence(
 
     top1 = candidates[0].confidence
 
-    # 条件1：Top1 置信度 ≥ 70%
-    if top1 >= 0.70:
+    # 条件1：Top1 置信度 ≥ 65%
+    if top1 >= 0.65:
         return True, False
 
     # 条件2：Top1 与 Top2 差值 ≥ 30%
@@ -84,5 +84,9 @@ def check_convergence(
         top2 = candidates[1].confidence
         if top1 - top2 >= 0.30:
             return True, False
+
+    # 条件3：Round ≥ 3 且 top1 ≥ 60% → 尽早给出结论
+    if current_round >= 3 and top1 >= 0.60:
+        return True, True
 
     return False, False

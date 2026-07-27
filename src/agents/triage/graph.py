@@ -67,6 +67,20 @@ def _parse_llm_json(response) -> dict:
     return json.loads(content)
 
 
+def _get_last_human_message(messages: list) -> str:
+    """获取最后一条用户消息，兼容 LangChain 对象和 Redis 反序列化的 dict。"""
+    for msg in reversed(messages):
+        if hasattr(msg, "content"):
+            type_name = msg.__class__.__name__
+            content = msg.content
+        else:
+            type_name = msg.get("type", "")
+            content = msg.get("content", "")
+        if type_name in ("HumanMessage", "human"):
+            return content
+    return ""
+
+
 # ════════════════════════════════════════════════════════════════════════
 # 节点函数
 # ════════════════════════════════════════════════════════════════════════
@@ -92,11 +106,7 @@ async def node_load_issue(state: TriageState, deps: TriageDeps) -> dict:
 
 async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
     """节点②：L1 LLM 口语→现象名 + DTC 提取。"""
-    last_msg = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            last_msg = msg.content
-            break
+    last_msg = _get_last_human_message(state.messages)
     if not last_msg:
         return {"phase": TriagePhase.ASK}
 
@@ -193,12 +203,27 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
 async def node_ask_details(state: TriageState, deps: TriageDeps) -> dict:
     """节点④：LLM 生成追问（问伴随现象、DTC、发生条件、频次）。"""
     candidate_summary = "\n".join(
-        f"- {c.name}（置信度 {c.confidence:.0%}，匹配现象: {', '.join(c.matched_phenomena)}）"
+        f"- {c.name}（置信度 {c.confidence:.0%}，匹配现象: {', '.join(c.matched_phenomena)}"
+        f"{'，未命中: ' + ', '.join([p for p in c.all_phenomena if p not in c.matched_phenomena]) if c.all_phenomena else ''}"
+        f"）"
         for c in state.candidate_causes[:5]
     ) if state.candidate_causes else "暂无高置信度候选根因"
 
+    # Build dialogue history from messages (handle both dict and object types)
+    dialogue_lines = []
+    for msg in state.messages[-6:]:
+        # Handle both LangChain message objects and dict-serialized messages from Redis
+        content = msg.content if hasattr(msg, "content") else msg.get("content", "")
+        type_name = msg.__class__.__name__ if hasattr(msg, "__class__") else msg.get("type", "")
+        role = "用户" if (type_name == "HumanMessage" or type_name == "human") else "助手"
+        dialogue_lines.append(f"{role}：{content[:200]}")
+    dialogue_history = "\n".join(dialogue_lines) if dialogue_lines else "（无历史）"
+
     prompt = ASK_DETAILS_PROMPT.format(
+        dialogue_history=dialogue_history,
         confirmed_phenomena="、".join(state.confirmed_phenomena) or "暂无",
+        denied_phenomena="、".join(state.denied_phenomena) or "暂无",
+        dtc_codes="、".join(state.dtc_codes) or "无",
         candidate_summary=candidate_summary,
     )
     response = await deps.llm_chat.ainvoke([SystemMessage(content=prompt)])
@@ -210,11 +235,7 @@ async def node_ask_details(state: TriageState, deps: TriageDeps) -> dict:
 
 async def node_parse_answer(state: TriageState, deps: TriageDeps) -> dict:
     """节点⑤：LLM 解析用户回复 → 更新 confirmed/denied/dtc。"""
-    last_msg = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            last_msg = msg.content
-            break
+    last_msg = _get_last_human_message(state.messages)
     if not last_msg:
         return {}
 
@@ -381,8 +402,62 @@ def build_triage_graph(deps: TriageDeps):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# 对外接口
+# 对外接口：供 call_triage_agent 工具 和 chat router 调用
 # ════════════════════════════════════════════════════════════════════════
+
+async def run_triage(
+    user_message: str,
+    thread_id: str,
+    deps: TriageDeps,
+    existing_state: TriageState | None = None,
+) -> tuple[str, TriageState]:
+    """
+    执行一轮分诊对话。
+
+    Args:
+        user_message: 用户本轮输入
+        thread_id: 会话标识（用于关联 Redis 状态）
+        deps: 依赖注入容器
+        existing_state: 上一轮的状态（多轮对话时传入）
+
+    Returns:
+        (assistant_reply, new_state)
+    """
+    vocabulary = await load_phenomenon_vocabulary()
+
+    if existing_state is None:
+        state = TriageState(
+            session_id=thread_id,
+            phenomenon_vocabulary=vocabulary,
+        )
+    else:
+        state = existing_state.model_copy()
+        state.round = existing_state.round + 1
+        state.phase = TriagePhase.EXTRACT
+        state.phenomenon_vocabulary = vocabulary
+
+    state.messages.append(HumanMessage(content=user_message))
+
+    graph = build_triage_graph(deps)
+    config = {"configurable": {"thread_id": thread_id}}
+    result_dict = await graph.ainvoke(state, config=config)
+    result = TriageState(**result_dict)
+
+    # Extract last AI message as reply (compatible with dict and object types)
+    reply = ""
+    for msg in reversed(result.messages):
+        if hasattr(msg, "content"):
+            type_name = msg.__class__.__name__
+            content = msg.content
+        else:
+            type_name = msg.get("type", "")
+            content = msg.get("content", "")
+        if type_name in ("AIMessage", "ai"):
+            reply = content
+            break
+
+    return reply, result
+
 
 async def load_phenomenon_vocabulary() -> str:
     """从 DB 加载现象码词汇表（供 LLM prompt 注入）。"""

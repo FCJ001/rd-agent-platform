@@ -1,21 +1,16 @@
-"""分诊 Agent 封装。装配 graph + vocabulary，提供 diagnose() 接口。"""
+"""分诊 Agent 封装。提供 diagnose() 接口，会话管理由调用方负责。"""
 
 import uuid
 from functools import lru_cache
 
-from langchain_core.messages import HumanMessage
-
 from src.agents.triage.state import TriageState, TriagePhase
 from src.agents.triage.graph import (
-    TriageDeps, build_triage_graph, load_phenomenon_vocabulary, _get_llm_json, _get_llm_chat,
+    TriageDeps, run_triage, _get_llm_json, _get_llm_chat,
 )
 from src.core.config import get_settings
 from src.infra.db import AsyncSessionLocal
 
 settings = get_settings()
-
-# ── 简易内存态存储（生产换 Redis） ──
-_session_states: dict[str, TriageState] = {}
 
 
 class TriageAgent:
@@ -24,12 +19,6 @@ class TriageAgent:
     def __init__(self):
         self.llm_json = _get_llm_json()
         self.llm_chat = _get_llm_chat()
-        self._vocabulary: str | None = None
-
-    async def _get_vocabulary(self) -> str:
-        if self._vocabulary is None:
-            self._vocabulary = await load_phenomenon_vocabulary()
-        return self._vocabulary
 
     def _build_deps(self) -> TriageDeps:
         async def _db_factory():
@@ -42,9 +31,16 @@ class TriageAgent:
         raw_input: str,
         session_id: str | None = None,
         issue_id: int | None = None,
+        existing_state: dict | None = None,
     ) -> dict:
         """
         执行一轮分诊诊断。
+
+        Args:
+            raw_input: 故障描述
+            session_id: 会话 ID（新会话自动生成）
+            issue_id: 关联问题单 ID
+            existing_state: 上一轮 TriageState 的序列化 dict（多轮时由调用方传入）
 
         Returns:
             dict with keys: session_id, status, round, normalized_phenomena,
@@ -52,38 +48,18 @@ class TriageAgent:
         """
         sid = session_id or str(uuid.uuid4())
         deps = self._build_deps()
-        graph = build_triage_graph(deps)
 
-        vocabulary = await self._get_vocabulary()
+        # Deserialize existing state if provided
+        prev_state = None
+        if existing_state:
+            prev_state = TriageState(**existing_state)
 
-        # Load or create session state
-        previous = _session_states.get(sid)
-        if previous is not None:
-            state = previous.model_copy()
-            state.round = previous.round + 1
-            state.messages.append(HumanMessage(content=raw_input))
-            state.phase = TriagePhase.EXTRACT  # reset for this pass
-        else:
-            state = TriageState(
-                session_id=sid,
-                issue_id=issue_id,
-                phenomenon_vocabulary=vocabulary,
-            )
-            state.messages.append(HumanMessage(content=raw_input))
-
-        config = {"configurable": {"thread_id": sid}}
-        result_dict = await graph.ainvoke(state, config=config)
-
-        # Reconstruct TriageState from result dict and persist for next round
-        result = TriageState(**result_dict)
-        _session_states[sid] = result
-
-        # Extract last AI message
-        reply = ""
-        for msg in reversed(result.messages):
-            if hasattr(msg, "content") and msg.__class__.__name__ == "AIMessage":
-                reply = msg.content
-                break
+        reply, result = await run_triage(
+            user_message=raw_input,
+            thread_id=sid,
+            deps=deps,
+            existing_state=prev_state,
+        )
 
         # Marshal candidates to dicts
         candidates_out = []
@@ -118,6 +94,7 @@ class TriageAgent:
             "confidence": result.confidence,
             "follow_up_questions": result.follow_up_questions if status == "asking" else [],
             "diagnostic_summary": result.diagnostic_summary if status == "converged" else "",
+            "_state": result.model_dump(),  # 调用方可缓存用于下一轮
         }
 
 
