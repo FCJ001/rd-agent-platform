@@ -56,24 +56,32 @@ async def call_triage_agent(message: str, runtime: ToolRuntime[UserContext]) -> 
 
 
 @tool
-async def call_dedup_check(issue_id: int, runtime: ToolRuntime) -> str:
-    """检查问题单是否与现有问题重复。
-    适用场景：创建新问题单前、或工程师怀疑当前问题是已知问题时。
+async def call_impact_agent(message: str, runtime: ToolRuntime[UserContext]) -> str:
+    """分析变更请求的影响范围和风险。
+    适用场景：评估 CR/变更单的影响范围，检查基线冲突、依赖冲突、重复变更。
+    在创建或评审变更请求时使用。
 
     Args:
-        issue_id: 待检查的问题单ID
+        message: 变更描述或 CR 编号（原文传递）
     """
-    from src.agents.dedup.matcher import get_dedup_matcher
-    matcher = get_dedup_matcher()
-    result = await matcher.detect(issue_id)
-
-    if not result.is_duplicate:
-        return f"问题单 #{issue_id} 未发现重复。"
-
-    lines = [f"问题单 #{issue_id} 可能与以下问题重复："]
-    for m in result.matches[:5]:
-        lines.append(f"- #{m.issue_id} {m.issue_no}（相似度 {m.combined_score:.0%}）: {m.title}")
-    return "\n".join(lines)
+    from src.agents.workers.impact_agent import get_impact_agent
+    agent = get_impact_agent()
+    report = await agent.analyze(message)
+    return report
 
 
-WORKER_TOOLS = [call_triage_agent, call_dedup_check]
+@tool
+async def call_report_agent(message: str, report_type: str = "DTC扫描", runtime: ToolRuntime[UserContext] = None) -> str:
+    """解读车辆报告/日志（DTC扫描报告、台架测试报告、OTA回归测试报告等）。
+    适用场景：工程师上传了检测报告需要解读、需要判断指标是否异常。
+
+    Args:
+        message: 报告内容或报告摘要
+        report_type: 报告类型（DTC扫描/台架测试/OTA回归），可选
+    """
+    from src.agents.workers.report_agent import get_report_agent
+    agent = get_report_agent()
+    return await agent.analyze(message, report_type)
+
+
+WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent]
