@@ -1,10 +1,8 @@
-"""Supervisor + 3 Workers 手动测试页面。
-启动：python test/test_supervisor_gradio.py
-依赖：pip install gradio httpx
-"""
+"""RD Agent Platform — Supervisor + Workers 测试控制台"""
 
 import asyncio
 import json
+import time
 import uuid
 
 import gradio as gr
@@ -13,271 +11,248 @@ import httpx
 BASE = "http://localhost:8000"
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 核心调用
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# API
+# ═══════════════════════════════════════════════════════════════
 
-async def sync_chat(user_id, session_id, message):
+async def _call_chat(user_id, session_id, message):
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{BASE}/api/v1/chat",
             json={"user_id": user_id, "session_id": session_id, "message": message},
         )
-        data = resp.json()
-        return data["data"]["reply"]
+        return resp.json()["data"]["reply"]
 
 
-def sync_chat_blocking(user_id, session_id, message):
-    """同步版本，供 Gradio handler 使用"""
+def call_chat(user_id, session_id, message):
     with httpx.Client(timeout=120) as client:
         resp = client.post(
             f"{BASE}/api/v1/chat",
             json={"user_id": user_id, "session_id": session_id, "message": message},
         )
-        data = resp.json()
-        return data["data"]["reply"]
+        return resp.json()["data"]["reply"]
 
 
-async def _stream_chat(user_id, session_id, message):
-    """SSE 流式 → 收集完整回复"""
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream(
-            "POST", f"{BASE}/api/v1/chat/stream",
-            json={"user_id": user_id, "session_id": session_id, "message": message},
-        ) as resp:
-            buffer = ""
-            full_reply = ""
-            async for chunk in resp.aiter_bytes():
-                buffer += chunk.decode("utf-8")
-                while "\n\n" in buffer:
-                    line, buffer = buffer.split("\n\n", 1)
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    try:
-                        d = json.loads(line[6:])
-                        if d["type"] == "token":
-                            full_reply += d["content"]
-                        elif d["type"] == "done":
-                            return full_reply
-                        elif d["type"] == "error":
-                            return f"[错误] {d['message']}"
-                    except json.JSONDecodeError:
-                        pass
-            return full_reply
+def call_chat_stream(user_id, session_id, message):
+    async def _stream():
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST", f"{BASE}/api/v1/chat/stream",
+                json={"user_id": user_id, "session_id": session_id, "message": message},
+            ) as resp:
+                buffer = ""
+                full = ""
+                async for chunk in resp.aiter_bytes():
+                    buffer += chunk.decode("utf-8")
+                    while "\n\n" in buffer:
+                        line, buffer = buffer.split("\n\n", 1)
+                        line = line.strip()
+                        if not line.startswith("data: "):
+                            continue
+                        try:
+                            d = json.loads(line[6:])
+                            if d["type"] == "token":
+                                full += d["content"]
+                            elif d["type"] == "done":
+                                return full
+                            elif d["type"] == "error":
+                                return f"\u26a0 {d['message']}"
+                        except json.JSONDecodeError:
+                            pass
+                return full
+    return asyncio.run(_stream())
 
 
-def stream_chat(user_id, session_id, message):
-    """同步包装器"""
-    return asyncio.run(_stream_chat(user_id, session_id, message))
+# ═══════════════════════════════════════════════════════════════
+# Test cases
+# ═══════════════════════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 测试用例
-# ══════════════════════════════════════════════════════════════════════
-
-TEST_CASES = {
-    "分诊首轮": "车机黑屏，DTC码U0100，高速上出现过两次",
-    "分诊追问": "触控也失灵了，原厂半年了，没有其他异常",
-    "变更影响": "分析变更影响：升级网关MCU固件到v3.2.1，目标基线2025Q3",
-    "报告解读": "解读台架测试报告：电池SOH 72%，单体压差 85mV，HMI冷启动 9200ms，绝缘电阻 0.5MΩ",
-    "记忆召回": "上个月也出现过黑屏问题，帮我查下之前的诊断结果",
+CASES = {
+    "triage":  "车机黑屏，DTC码U0100，高速上出现过两次",
+    "follow":  "触控也失灵了，原厂半年了，没有其他异常",
+    "impact":  "分析变更影响：升级网关MCU固件到v3.2.1，目标基线2025Q3",
+    "report":  "解读台架测试报告：电池SOH 72%，单体压差 85mV，HMI冷启动 9200ms，绝缘电阻 0.5M\u03A9",
+    "memory":  "上个月也出现过黑屏问题，帮我查下之前的诊断结果",
 }
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Gradio UI
-# ══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# Handlers
+# ═══════════════════════════════════════════════════════════════
 
-CSS = """
-.header { text-align: center; margin: 20px 0; }
-.header h1 { font-size: 1.6em; margin: 0; }
-.header p { color: #888; margin: 4px 0 0; }
-.worker-tag { display: inline-block; padding: 2px 8px; border-radius: 4px;
-              font-size: 0.8em; margin-right: 6px; color: white; }
-.tag-triage { background: #10b981; }
-.tag-impact { background: #f59e0b; }
-.tag-report { background: #3b82f6; }
-.tag-memory { background: #8b5cf6; }
-footer { visibility: hidden; }
-"""
-
-
-def detect_workers(reply: str) -> str:
-    tags = []
-    if "置信度" in reply or ("诊断" in reply and "根因" in reply):
-        tags.append(("分诊", "tag-triage"))
-    if "风险" in reply and ("变更" in reply or "基线" in reply or "依赖" in reply):
-        tags.append(("影响分析", "tag-impact"))
-    if "紧急" in reply or ("指标" in reply and "异常" in reply):
-        tags.append(("报告解读", "tag-report"))
-    if "历史" in reply or "记忆" in reply or "之前" in reply:
-        tags.append(("记忆", "tag-memory"))
-    if not tags:
-        return '<span class="worker-tag" style="background:#9ca3af">Supervisor</span>'
-    return "".join(
-        f'<span class="worker-tag {c}">{n}</span>' for n, c in tags
-    )
-
-
-# ── 同步 handler（asyncio.run 包装，兼容 Gradio）─────────────────────
-
-def on_send(message, uid_val, sid_val, history):
-    """发送消息 → SSE 流式收集 → 更新聊天记录"""
+def on_send(message, uid, sid, history):
     if not message.strip():
-        return history, sid_val, "", ""
-    if not sid_val:
-        sid_val = f"s_{uuid.uuid4().hex[:6]}"
+        return history, sid, None, ""
+    if not sid:
+        sid = f"s_{uuid.uuid4().hex[:6]}"
     history = list(history) if history else []
     history.append({"role": "user", "content": message})
 
-    reply = stream_chat(uid_val, sid_val, message)
+    reply = call_chat_stream(uid, sid, message)
     history.append({"role": "assistant", "content": reply})
 
-    tag_html = detect_workers(reply)
-    return history, sid_val, tag_html, ""
+    agent = _detect_agent(reply)
+    return history, sid, agent, ""
 
 
-def quick_test(case_key, uid_val, sid_val, history):
-    """快捷测试按钮"""
-    if case_key == "分诊追问":
-        pass  # 复用当前 session 模拟追问
+def on_quick_test(key, uid, sid, history):
+    if key == "follow":
+        pass
     else:
-        sid_val = f"s_{uuid.uuid4().hex[:6]}"
+        sid = f"s_{uuid.uuid4().hex[:6]}"
     history = list(history) if history else []
-    history.append({"role": "user", "content": TEST_CASES[case_key]})
+    history.append({"role": "user", "content": CASES[key]})
 
-    reply = stream_chat(uid_val, sid_val, TEST_CASES[case_key])
+    reply = call_chat_stream(uid, sid, CASES[key])
     history.append({"role": "assistant", "content": reply})
 
-    tag_html = detect_workers(reply)
-    return history, sid_val, tag_html
+    agent = _detect_agent(reply)
+    return history, sid, agent
 
 
-def full_flow(uid_val):
-    """一键完整流程：5 轮端到端测试"""
+def on_full_test(uid):
     lines = []
+    t_total = time.time()
+
     sid1 = f"f_{uuid.uuid4().hex[:4]}"
 
-    # Round 1: 分诊诊断
-    lines.append("### Round 1: 分诊诊断\n")
-    r1 = sync_chat_blocking(uid_val, sid1, TEST_CASES["分诊首轮"])
-    lines.append(r1[:400])
+    for i, (label, key) in enumerate([
+        ("Triage \u5206\u8bca", "triage"),
+        ("Triage \u8ffd\u95ee (bypass)", "follow"),
+        ("Memory \u8bb0\u5fc6\u53ec\u56de", "memory"),
+        ("Impact \u53d8\u66f4\u5f71\u54cd\u5206\u6790", "impact"),
+        ("Report \u62a5\u544a\u89e3\u8bfb", "report"),
+    ]):
+        t0 = time.time()
+        sid = sid1 if key == "follow" else f"f_{uuid.uuid4().hex[:4]}"
+        reply = call_chat(uid, sid, CASES[key])
+        elapsed = time.time() - t0
+        status = "\u2705" if elapsed < 30 else "\u23f3"
+        lines.append(f"### {status} R{i+1}: {label}  ({elapsed:.1f}s)\n\n{reply[:400]}")
 
-    # Round 2: 追问（同 session bypass）
-    lines.append("\n### Round 2: 追问（同 session bypass）\n")
-    r2 = sync_chat_blocking(uid_val, sid1, TEST_CASES["分诊追问"])
-    conv = "收敛" if "置信度" in r2 else "继续追问"
-    lines.append(f"**状态：{conv}**\n\n{r2[:300]}")
-
-    # Round 3: 新会话 → 记忆召回
-    sid2 = f"f_{uuid.uuid4().hex[:4]}"
-    lines.append("\n### Round 3: 新会话 → 记忆召回\n")
-    r3 = sync_chat_blocking(uid_val, sid2, TEST_CASES["记忆召回"])
-    ok = "成功" if ("U0100" in r3 or "历史" in r3 or "之前" in r3) else "未命中"
-    lines.append(f"**召回：{ok}**\n\n{r3[:400]}")
-
-    # Round 4: 影响分析
-    sid3 = f"f_{uuid.uuid4().hex[:4]}"
-    lines.append("\n### Round 4: 影响分析\n")
-    r4 = sync_chat_blocking(uid_val, sid3, TEST_CASES["变更影响"])
-    lines.append(r4[:300])
-
-    # Round 5: 报告解读
-    sid4 = f"f_{uuid.uuid4().hex[:4]}"
-    lines.append("\n### Round 5: 报告解读\n")
-    r5 = sync_chat_blocking(uid_val, sid4, TEST_CASES["报告解读"])
-    lines.append(r5[:300])
-
-    return "\n".join(lines)
+    lines.append(f"\n\n> \u603b\u8017\u65f6: **{time.time() - t_total:.0f}s**")
+    return "\n\n".join(lines)
 
 
-def new_session():
-    """生成新用户和会话 ID"""
-    return f"u_{uuid.uuid4().hex[:6]}", f"s_{uuid.uuid4().hex[:6]}"
+def _detect_agent(reply):
+    if "\u7f6e\u4fe1\u5ea6" in reply or ("\u8bca\u65ad" in reply and "\u6839\u56e0" in reply):
+        return "\u5206\u8bca Agent"
+    if "\u98ce\u9669" in reply and ("\u53d8\u66f4" in reply or "\u57fa\u7ebf" in reply):
+        return "\u5f71\u54cd\u5206\u6790 Agent"
+    if "\u6307\u6807" in reply and "\u5f02\u5e38" in reply:
+        return "\u62a5\u544a\u89e3\u8bfb Agent"
+    if "\u5386\u53f2" in reply or "\u8bb0\u5fc6" in reply:
+        return "Supervisor (Memory)"
+    return "Supervisor"
 
 
-def clear_chat():
-    return [], "", ""
+# ═══════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════
+
+CSS = """
+body, .gradio-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+footer { display: none !important; }
+
+.header {
+    padding: 20px 0 8px 0;
+    border-bottom: 1px solid #e5e7eb;
+    margin-bottom: 16px;
+}
+.header h2 { margin: 0; font-weight: 600; color: #111827; font-size: 1.25rem; }
+.header span { color: #6b7280; font-size: 0.875rem; }
+
+.test-panel {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 16px;
+}
+.test-panel h4 {
+    margin: 0 0 12px 0;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #6b7280;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.status-bar {
+    padding: 6px 12px;
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    color: #6b7280;
+    margin-bottom: 8px;
+}
+.status-bar .agent-name { color: #111827; font-weight: 500; }
+
+/* Compact buttons in test panel */
+.test-panel button {
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+    border-radius: 6px !important;
+    margin-bottom: 6px !important;
+}
+"""
 
 
 def build_ui():
-    with gr.Blocks(title="Supervisor + 3 Workers 测试") as demo:
+    with gr.Blocks(title="RD Agent Platform") as demo:
 
-        gr.HTML(
-            '<div class="header">'
-            '<h1>Supervisor + 3 Workers 测试</h1>'
-            '<p>call_triage_agent · call_impact_agent · call_report_agent</p>'
-            '</div>'
-        )
+        # ── Header ──
+        with gr.Row(elem_classes="header"):
+            gr.HTML('<h2>RD Agent Platform <span style="font-weight:400;color:#6b7280;">\u00b7 Test Console</span></h2>')
 
-        # ── 会话 ──
+        # ── Session bar ──
         with gr.Row():
-            uid = gr.Textbox(label="User ID", value="test", scale=1)
-            sid = gr.Textbox(label="Session ID（留空自动生成）", scale=2)
-            new_btn = gr.Button("新会话", scale=1, size="sm")
-            clear_btn = gr.Button("清屏", scale=1, size="sm")
+            uid = gr.Textbox(label="User ID", value="test", scale=2, show_label=False, container=False)
+            sid = gr.Textbox(label="Session", placeholder="Auto-generated", scale=4, show_label=False, container=False)
+            new_btn = gr.Button("\u65b0\u4f1a\u8bdd", size="sm", scale=1)
+            clear_btn = gr.Button("\u6e05\u5c4f", size="sm", scale=1)
 
-        new_btn.click(fn=new_session, outputs=[uid, sid])
+        new_btn.click(lambda: (f"u_{uuid.uuid4().hex[:6]}", f"s_{uuid.uuid4().hex[:6]}"), inputs=[], outputs=[uid, sid])
 
-        # ── 对话 ──
-        worker_tag = gr.HTML("")
+        # ── Agent status ──
+        agent_label = gr.Textbox(value="\u5c31\u7eea", interactive=False, show_label=False, container=False, elem_classes="status-bar")
 
+        # ── Main: chat + panel ──
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(label="对话记录", height=480)
+                chatbot = gr.Chatbot(label="", height=500, show_label=False)
                 msg = gr.Textbox(
-                    label="消息",
-                    placeholder="试试：车机黑屏，DTC码U0100 / 分析变更影响 / 解读测试报告...",
+                    placeholder="\u8f93\u5165\u6d88\u606f\u2026  \u4f8b\u5982\uff1a\u8f66\u673a\u9ed1\u5c4f\uff0cDTC\u7801U0100 / \u5206\u6790\u53d8\u66f4\u5f71\u54cd / \u89e3\u8bfb\u6d4b\u8bd5\u62a5\u544a",
+                    show_label=False, container=False,
                 )
 
-            with gr.Column(scale=1):
-                gr.Markdown("#### 快速测试")
-                btn_triage = gr.Button("分诊诊断", variant="secondary")
-                btn_impact = gr.Button("变更影响", variant="secondary")
-                btn_report = gr.Button("报告解读", variant="secondary")
-                gr.Markdown("---")
-                btn_memory = gr.Button("跨会话记忆", variant="secondary")
-                gr.Markdown("---")
-                btn_full = gr.Button("一键完整流程", variant="primary")
+            with gr.Column(scale=1, elem_classes="test-panel"):
+                gr.HTML('<h4>\u5feb\u901f\u6d4b\u8bd5</h4>')
+                btn_triage = gr.Button("\U0001f52c \u5206\u8bca\u8bca\u65ad", variant="secondary")
+                btn_impact = gr.Button("\U0001f4ca \u53d8\u66f4\u5f71\u54cd\u5206\u6790", variant="secondary")
+                btn_report = gr.Button("\U0001f4cb \u62a5\u544a\u89e3\u8bfb", variant="secondary")
+                btn_memory = gr.Button("\U0001f9e0 \u8de8\u4f1a\u8bdd\u8bb0\u5fc6", variant="secondary")
+                btn_full = gr.Button("\u25b6 \u4e00\u952e\u5b8c\u6574\u6d41\u7a0b", variant="primary")
 
-        # ── 事件绑定 ──
+        # ── Full test output ──
+        with gr.Row():
+            full_output = gr.Textbox(
+                label="", lines=20, max_lines=40, show_label=False,
+                placeholder="\u70b9\u51fb\u300c\u4e00\u952e\u5b8c\u6574\u6d41\u7a0b\u300d\u67e5\u770b 5 \u8f6e\u7aef\u5230\u7aef\u6d4b\u8bd5\u7ed3\u679c\u2026",
+                container=False,
+            )
 
-        # 消息发送
-        msg.submit(
-            fn=on_send,
-            inputs=[msg, uid, sid, chatbot],
-            outputs=[chatbot, sid, worker_tag, msg],
-        )
+        # ── Events ──
+        msg.submit(on_send, [msg, uid, sid, chatbot], [chatbot, sid, agent_label, msg])
 
-        # 快捷按钮（用 lambda 偏应用 case_key）
-        btn_triage.click(
-            fn=lambda u, s, h: quick_test("分诊首轮", u, s, h),
-            inputs=[uid, sid, chatbot],
-            outputs=[chatbot, sid, worker_tag],
-        )
-        btn_impact.click(
-            fn=lambda u, s, h: quick_test("变更影响", u, s, h),
-            inputs=[uid, sid, chatbot],
-            outputs=[chatbot, sid, worker_tag],
-        )
-        btn_report.click(
-            fn=lambda u, s, h: quick_test("报告解读", u, s, h),
-            inputs=[uid, sid, chatbot],
-            outputs=[chatbot, sid, worker_tag],
-        )
-        btn_memory.click(
-            fn=lambda u, s, h: quick_test("记忆召回", u, s, h),
-            inputs=[uid, sid, chatbot],
-            outputs=[chatbot, sid, worker_tag],
-        )
+        btn_triage.click(lambda u, s, h: on_quick_test("triage", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
+        btn_impact.click(lambda u, s, h: on_quick_test("impact", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
+        btn_report.click(lambda u, s, h: on_quick_test("report", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
+        btn_memory.click(lambda u, s, h: on_quick_test("memory", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
 
-        clear_btn.click(fn=clear_chat, outputs=[chatbot, sid, worker_tag])
+        clear_btn.click(lambda: ([], "", "\u5c31\u7eea"), inputs=[], outputs=[chatbot, sid, agent_label])
 
-        # ── 一键完整流程 ──
-        full_output = gr.Markdown("")
-
-        btn_full.click(fn=full_flow, inputs=[uid], outputs=[full_output])
+        btn_full.click(on_full_test, [uid], [full_output])
 
     return demo
 
