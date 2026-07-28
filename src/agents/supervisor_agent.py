@@ -1,29 +1,20 @@
 """Supervisor Agent — 总调度 Agent，按用户意图路由到对应 Worker 工具。"""
 
-from dataclasses import dataclass
-
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.redis import AsyncRedisSaver
-from langgraph.prebuilt import ToolRuntime
 
 from src.agents.tools.store_tools import save_memory, search_memory
 from src.agents.tools.worker_tools import WORKER_TOOLS
 from src.agents.tools.tool_call_repair import ToolCallRepairMiddleware
 from src.core.config import get_settings
+from src.core.deps import UserContext
 from src.infra.milvus_client import get_milvus_client_alias
 from src.infra.milvus_store import MilvusStore
 from src.infra.redis_cache import get_checkpointer_redis
 
 settings = get_settings()
-
-
-@dataclass
-class UserContext:
-    user_id: str
-    session_id: str
-    role: str = "engineer"  # engineer/business/aftersales/customer
 
 
 SUPERVISOR_SYSTEM_PROMPT = """你是汽车研发领域的智能总助手，服务于整车研发 ALM（应用生命周期管理）平台。

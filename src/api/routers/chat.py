@@ -10,8 +10,9 @@ from fastapi.responses import StreamingResponse
 from langchain_community.embeddings import DashScopeEmbeddings
 from pydantic import BaseModel, Field
 
-from src.agents.supervisor_agent import get_supervisor_agent, UserContext
+from src.agents.supervisor_agent import get_supervisor_agent
 from src.agents.triage.graph import run_triage, TriageDeps
+from src.core.deps import UserContext, get_current_user
 from src.agents.triage.state import TriageState, TriagePhase
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
@@ -145,7 +146,8 @@ async def chat(req: ChatRequest):
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": req.message}]},
             config=config,
-            context=UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role),
+            context=UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role,
+                               business_line=None, owner_domain_id=None),
         )
         reply = result["messages"][-1].content
         return ResponseSchema(data=ChatResponse(reply=reply, session_id=req.session_id))
@@ -193,7 +195,8 @@ async def chat_stream(req: ChatRequest):
                 # ── 无活跃分诊：Supervisor 流式推送 ──
                 agent = await get_supervisor_agent()
                 config = {"configurable": {"thread_id": thread_id}}
-                ctx = UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role)
+                ctx = UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role,
+                                  business_line=None, owner_domain_id=None)
 
                 async for chunk in agent.astream(
                     {"messages": [{"role": "user", "content": req.message}]},

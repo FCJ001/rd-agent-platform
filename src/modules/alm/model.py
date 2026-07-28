@@ -279,6 +279,63 @@ class AiDedupLink(BaseModel):
     )
 
 
+class CauseDtc(BaseModel):
+    """根因-DTC 关联表（关系型备份，与 Neo4j POINTS_TO 同步）"""
+
+    __tablename__ = "cause_dtc"
+
+    cause_id: Mapped[int] = mapped_column(ForeignKey("root_causes.id", ondelete="CASCADE"), nullable=False, comment="根因 ID")
+    dtc_id: Mapped[int] = mapped_column(ForeignKey("dtc_codes.id", ondelete="CASCADE"), nullable=False, comment="DTC 故障码 ID")
+    relation_type: Mapped[str] = mapped_column(String(20), default="direct", comment="关联类型：direct=直接指向 / indirect=间接关联")
+
+    __table_args__ = (
+        UniqueConstraint("cause_id", "dtc_id", name="uq_cause_dtc"),
+        Index("ix_cd_cause", "cause_id"),
+        Index("ix_cd_dtc", "dtc_id"),
+    )
+
+
+class AiImpactAnalysis(BaseModel):
+    """变更影响分析影子表"""
+
+    __tablename__ = "ai_impact_analysis"
+
+    change_request_id: Mapped[int | None] = mapped_column(ForeignKey("alm_change_requests.id", ondelete="CASCADE"), comment="来源变更单 ID")
+    session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID")
+    raw_input: Mapped[str | None] = mapped_column(Text, comment="用户原始输入")
+    scope_result: Mapped[str | None] = mapped_column(Text, comment="影响范围 JSON")
+    dependency_result: Mapped[str | None] = mapped_column(Text, comment="依赖冲突 JSON")
+    baseline_conflicts: Mapped[str | None] = mapped_column(Text, comment="基线冲突 JSON")
+    duplicate_result: Mapped[str | None] = mapped_column(Text, comment="重复变更 JSON")
+    risk_level: Mapped[str] = mapped_column(String(20), default="medium", comment="风险等级：low/medium/high/critical")
+    report_md: Mapped[str | None] = mapped_column(Text, comment="Markdown 分析报告")
+
+    __table_args__ = (
+        Index("ix_impact_cr", "change_request_id"),
+        Index("ix_impact_session", "session_id"),
+    )
+
+
+class AiReportInterpretation(BaseModel):
+    """报告/日志解读影子表"""
+
+    __tablename__ = "ai_report_interpretations"
+
+    source_issue_id: Mapped[int | None] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), comment="来源问题单 ID")
+    report_type: Mapped[str] = mapped_column(String(30), nullable=False, comment="报告类型：DTC扫描/台架测试/OTA回归")
+    minio_key: Mapped[str | None] = mapped_column(String(200), comment="MinIO 附件路径")
+    raw_text: Mapped[str | None] = mapped_column(Text, comment="原始报告文本")
+    parsed_metrics: Mapped[str | None] = mapped_column(Text, comment="解析指标 JSON [{metric_key, value, unit, normal, severity}]")
+    abnormal_count: Mapped[int] = mapped_column(Integer, default=0, comment="异常指标数")
+    interpretation: Mapped[str | None] = mapped_column(Text, comment="LLM 生成的结构化解读")
+    reviewed: Mapped[bool | None] = mapped_column(Boolean, comment="人工复核结果")
+
+    __table_args__ = (
+        Index("ix_report_issue", "source_issue_id"),
+        Index("ix_report_type", "report_type"),
+    )
+
+
 # ==========================================================
 # ④ 幂等事件日志
 # Webhook / 定时同步的去重依据：同一个 (event_type, entity_type, entity_id, entity_version)

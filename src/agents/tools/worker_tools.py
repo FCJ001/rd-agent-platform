@@ -1,21 +1,13 @@
 """Worker 工具：封装分诊 Agent 和去重匹配器为 Supervisor 可调用的 @tool。"""
 
-from dataclasses import dataclass
-
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
 from src.agents.triage.graph import run_triage, TriageDeps, build_triage_graph
 from src.agents.triage.state import TriagePhase
 from src.agents.workers.triage_agent import TriageAgent
+from src.core.deps import UserContext
 from src.infra.redis_cache import get_checkpointer_redis
-
-
-@dataclass
-class UserContext:
-    user_id: str
-    session_id: str
-    role: str = "engineer"  # engineer/business/aftersales/customer
 
 
 @tool
