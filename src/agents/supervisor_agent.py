@@ -23,6 +23,7 @@ settings = get_settings()
 class UserContext:
     user_id: str
     session_id: str
+    role: str = "engineer"  # engineer/business/aftersales/customer
 
 
 SUPERVISOR_SYSTEM_PROMPT = """你是汽车研发领域的智能总助手，服务于整车研发 ALM（应用生命周期管理）平台。

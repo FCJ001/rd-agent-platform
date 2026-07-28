@@ -16,6 +16,7 @@ async def load_issue_context(db: AsyncSession, issue_id: int) -> dict | None:
         "issue_title": issue.title or "",
         "issue_desc": issue.description or "",
         "issue_dtc_snapshot": issue.dtc_snapshot or "",
+        "source": issue.source or "customer",
     }
 
 

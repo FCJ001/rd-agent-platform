@@ -54,3 +54,5 @@ class TriageState(BaseModel):
     force_conclude: bool = False
     # phenomenon vocabulary cache (populated at graph build time)
     phenomenon_vocabulary: str = Field(default="", description="已知现象名+别名列表，用于 LLM prompt")
+    # 当前查看结论的人的角色，影响输出格式（engineer/business/aftersales/customer）
+    viewer_role: str = Field(default="customer", description="查看者角色")

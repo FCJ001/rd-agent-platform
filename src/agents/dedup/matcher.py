@@ -1,8 +1,18 @@
-"""问题去重匹配器。四信号加权打分。"""
+"""问题去重匹配器。架构设计：双门槛 —— 向量相似 + 结构化精确匹配。
+
+is_dup = sim_score >= 0.88 and (same_model_and_sw or same_dtc)
+"""
 
 from dataclasses import dataclass, field
 
-from src.infra.neo4j_client import get_neo4j_driver
+from langchain_community.embeddings import DashScopeEmbeddings
+
+from src.core.config import get_settings
+
+settings = get_settings()
+
+# 向量相似阈值
+SIMILARITY_THRESHOLD = 0.88
 
 
 @dataclass
@@ -10,11 +20,8 @@ class DedupMatch:
     issue_id: int
     issue_no: str
     title: str
-    text_similarity: float = 0.0
-    dtc_overlap: float = 0.0
-    phenom_overlap: float = 0.0
-    root_cause_match: float = 0.0
-    combined_score: float = 0.0
+    similarity: float = 0.0
+    evidence: str = ""  # "model_and_sw" | "dtc" | "model_and_sw+dtc"
 
 
 @dataclass
@@ -24,299 +31,222 @@ class DedupResult:
     matches: list[DedupMatch] = field(default_factory=list)
 
 
-class DedupMatcher:
-    """问题去重匹配器。四信号加权：文本相似 / DTC 重叠 / 现象重叠 / 根因匹配。"""
+def _get_embedding_model():
+    return DashScopeEmbeddings(
+        model="text-embedding-v3",
+        dashscope_api_key=settings.DASHSCOPE_API_KEY,
+    )
 
-    def __init__(self, threshold: float = 0.70):
-        self.threshold = threshold
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = (sum(a * a for a in vec_a)) ** 0.5
+    norm_b = (sum(b * b for b in vec_b)) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _split_dtc(dtc_str: str | None) -> set[str]:
+    if not dtc_str:
+        return set()
+    return {x.strip() for x in dtc_str.replace("\uff0c", ",").split(",") if x.strip()}
+
+
+class DedupMatcher:
+    """问题去重匹配器。双门槛：向量相似 (Milvus embedding) ≥ 0.88 + 结构化精确匹配。"""
+
+    def __init__(self):
+        self._embedding_model = None
+
+    @property
+    def embedding_model(self):
+        if self._embedding_model is None:
+            self._embedding_model = _get_embedding_model()
+        return self._embedding_model
 
     async def detect(self, issue_id: int) -> DedupResult:
         """检测指定问题单是否与已有问题重复。"""
-        result = DedupResult(source_issue_id=issue_id)
-
-        source = await self._load_issue(issue_id)
+        source = await self._load_issue_full(issue_id)
         if not source:
-            return result
+            return DedupResult(source_issue_id=issue_id)
 
-        candidates = await self._load_candidates(source)
-        if not candidates:
-            return result
-
-        source_phenomena, source_rc = await self._load_triage_info(issue_id)
-
-        await self._score_candidates(result, source, candidates, source_phenomena, source_rc)
-        return result
+        candidates = await self._load_candidates_full(source["business_line"], exclude_id=issue_id)
+        return await self._match(source, candidates, issue_id)
 
     async def detect_by_text(
         self, description: str, dtc_codes: str = "", business_line: str = "ia",
+        model_code: str = "", sw_version: str = "",
     ) -> DedupResult:
         """根据文本描述搜索重复问题（无需 issue_id）。"""
-        import psycopg2
-        from src.core.config import get_settings
+        source = {
+            "id": 0,
+            "title": description,
+            "description": "",
+            "dtc_snapshot": dtc_codes,
+            "model_code": model_code,
+            "sw_version": sw_version,
+        }
+        candidates = await self._load_candidates_full(business_line)
+        return await self._match(source, candidates, 0)
 
-        result = DedupResult(source_issue_id=0)
-        s = get_settings()
-
-        try:
-            conn = psycopg2.connect(
-                host=s.DB_HOST, port=s.DB_PORT,
-                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
-            )
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, issue_no, title, description, dtc_snapshot, business_line "
-                "FROM alm_issues "
-                "WHERE status IN ('open', 'analyzing') "
-                "  AND business_line = %s "
-                "  AND updated_at > NOW() - INTERVAL '90 days' "
-                "ORDER BY updated_at DESC "
-                "LIMIT 50",
-                (business_line,),
-            )
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-
-            candidates = [
-                {
-                    "id": r[0], "issue_no": r[1], "title": r[2],
-                    "description": r[3] or "", "dtc_snapshot": r[4] or "",
-                    "business_line": r[5] or "",
-                }
-                for r in rows
-            ]
-        except Exception:
-            return result
-
+    async def _match(
+        self, source: dict, candidates: list[dict], source_id: int,
+    ) -> DedupResult:
+        """双门槛匹配逻辑。"""
+        result = DedupResult(source_issue_id=source_id)
         if not candidates:
             return result
 
-        source = {"title": description, "description": "", "dtc_snapshot": dtc_codes}
+        # ── 门槛一：向量相似 ──
+        source_text = f"{source.get('title', '')} {source.get('description', '')}"
+        source_dtc = _split_dtc(source.get("dtc_snapshot"))
+        source_model = source.get("model_code", "")
+        source_sw = source.get("sw_version", "")
 
-        # Extract phenomena from description (simple keyword extraction)
-        source_phenomena = await self._extract_phenomena_keywords(description)
-        source_rc = ""
-
-        await self._score_candidates(result, source, candidates, source_phenomena, source_rc)
-        return result
-
-    async def _extract_phenomena_keywords(self, text: str) -> list[str]:
-        """从文本中提取可能的现象关键词（简单匹配 phenomena 表）。"""
-        import psycopg2
-        from src.core.config import get_settings
-        s = get_settings()
         try:
-            conn = psycopg2.connect(
-                host=s.DB_HOST, port=s.DB_PORT,
-                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
-            )
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM phenomena ORDER BY id")
-            all_phenomena = [r[0] for r in cur.fetchall()]
-            cur.close()
-            conn.close()
-
-            return [p for p in all_phenomena if p in text]
+            source_emb = self.embedding_model.embed_query(source_text)
         except Exception:
-            return []
-
-    async def _score_candidates(
-        self, result: DedupResult, source: dict, candidates: list[dict],
-        source_phenomena: list[str], source_rc: str,
-    ):
-        """对候选列表打分，筛选重复项。"""
-        source_id = source.get("id", 0)
+            return result
 
         for cand in candidates:
             cand_id = cand["id"]
             if cand_id == source_id:
                 continue
 
-            cand_phenomena, cand_rc = await self._load_triage_info(cand_id)
+            cand_text = f"{cand.get('title', '')} {cand.get('description', '')}"
+            try:
+                cand_emb = self.embedding_model.embed_query(cand_text)
+            except Exception:
+                continue
 
-            text_sim = self._compute_text_jaccard(
-                f"{source.get('title', '')} {source.get('description', '')}",
-                f"{cand.get('title', '')} {cand.get('description', '')}",
+            sim_score = _cosine_similarity(source_emb, cand_emb)
+            if sim_score < SIMILARITY_THRESHOLD:
+                continue
+
+            # ── 门槛二：结构化精确匹配 ──
+            cand_model = cand.get("model_code", "")
+            cand_sw = cand.get("sw_version", "")
+            cand_dtc = _split_dtc(cand.get("dtc_snapshot"))
+
+            same_model_and_sw = (
+                source_model and cand_model and source_model == cand_model
+                and source_sw and cand_sw and source_sw == cand_sw
             )
+            same_dtc = bool(source_dtc and cand_dtc and (source_dtc & cand_dtc))
 
-            dtc_sim = self._compute_dtc_jaccard(
-                source.get("dtc_snapshot", ""),
-                cand.get("dtc_snapshot", ""),
-            )
+            if same_model_and_sw and same_dtc:
+                evidence = "model_and_sw+dtc"
+            elif same_model_and_sw:
+                evidence = "model_and_sw"
+            elif same_dtc:
+                evidence = "dtc"
+            else:
+                continue  # 向量过阈值但结构不匹配 → 不判定为重复
 
-            phenom_sim = await self._compute_phenom_overlap(
-                source_phenomena, cand_phenomena,
-            )
+            result.matches.append(DedupMatch(
+                issue_id=cand_id,
+                issue_no=cand.get("issue_no", ""),
+                title=cand.get("title", ""),
+                similarity=round(sim_score, 4),
+                evidence=evidence,
+            ))
 
-            rc_match = 1.0 if source_rc and cand_rc and source_rc == cand_rc else 0.0
-
-            combined = (
-                0.30 * text_sim +
-                0.25 * dtc_sim +
-                0.25 * phenom_sim +
-                0.20 * rc_match
-            )
-
-            if combined >= self.threshold:
-                result.matches.append(DedupMatch(
-                    issue_id=cand_id,
-                    issue_no=cand.get("issue_no", ""),
-                    title=cand.get("title", ""),
-                    text_similarity=text_sim,
-                    dtc_overlap=dtc_sim,
-                    phenom_overlap=phenom_sim,
-                    root_cause_match=rc_match,
-                    combined_score=combined,
-                ))
-
-        result.matches.sort(key=lambda x: x.combined_score, reverse=True)
+        result.matches.sort(key=lambda x: x.similarity, reverse=True)
         result.is_duplicate = len(result.matches) > 0
 
-    async def _load_issue(self, issue_id: int) -> dict | None:
-        """从 PG 加载问题单数据。"""
+        # ── 持久化到 ai_dedup_links ──
+        if result.is_duplicate and source_id > 0:
+            await self._save_dedup_links(source_id, result.matches)
+
+        return result
+
+    async def _save_dedup_links(self, source_id: int, matches: list[DedupMatch]) -> None:
+        """将去重结果写入 ai_dedup_links 影子表。"""
         import psycopg2
-        from src.core.config import get_settings
-        s = get_settings()
         try:
             conn = psycopg2.connect(
-                host=s.DB_HOST, port=s.DB_PORT,
-                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
+                host=settings.DB_HOST, port=settings.DB_PORT,
+                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
+            )
+            cur = conn.cursor()
+            for m in matches:
+                cur.execute(
+                    "INSERT INTO ai_dedup_links (source_issue_id, matched_issue_id, similarity, evidence, is_duplicate) "
+                    "VALUES (%s, %s, %s, %s, %s) "
+                    "ON CONFLICT (source_issue_id, matched_issue_id) DO UPDATE SET "
+                    "similarity = EXCLUDED.similarity, evidence = EXCLUDED.evidence, "
+                    "is_duplicate = EXCLUDED.is_duplicate, updated_at = NOW()",
+                    (source_id, m.issue_id, m.similarity, m.evidence, True),
+                )
+            conn.commit()
+            cur.close(); conn.close()
+        except Exception:
+            pass  # 写回失败不影响主流程
+
+    async def _load_issue_full(self, issue_id: int) -> dict | None:
+        import psycopg2
+        try:
+            conn = psycopg2.connect(
+                host=settings.DB_HOST, port=settings.DB_PORT,
+                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
             )
             cur = conn.cursor()
             cur.execute(
-                "SELECT id, issue_no, title, description, dtc_snapshot, business_line "
-                "FROM alm_issues WHERE id = %s",
+                "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                "sw_version, business_line FROM alm_issues WHERE id = %s",
                 (issue_id,),
             )
             row = cur.fetchone()
-            cur.close()
-            conn.close()
+            cur.close(); conn.close()
             if not row:
                 return None
             return {
                 "id": row[0], "issue_no": row[1], "title": row[2],
                 "description": row[3] or "", "dtc_snapshot": row[4] or "",
-                "business_line": row[5] or "",
+                "model_code": row[5] or "", "sw_version": row[6] or "",
+                "business_line": row[7] or "",
             }
         except Exception:
             return None
 
-    async def _load_candidates(self, source: dict) -> list[dict]:
-        """加载候选问题单（同业务线、未关闭、近90天）。"""
+    async def _load_candidates_full(self, business_line: str, exclude_id: int | None = None) -> list[dict]:
         import psycopg2
-        from src.core.config import get_settings
-        s = get_settings()
         try:
             conn = psycopg2.connect(
-                host=s.DB_HOST, port=s.DB_PORT,
-                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
+                host=settings.DB_HOST, port=settings.DB_PORT,
+                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
             )
             cur = conn.cursor()
-            cur.execute(
-                "SELECT id, issue_no, title, description, dtc_snapshot, business_line "
-                "FROM alm_issues "
-                "WHERE status IN ('open', 'analyzing') "
-                "  AND business_line = %s "
-                "  AND id != %s "
-                "  AND updated_at > NOW() - INTERVAL '90 days' "
-                "ORDER BY updated_at DESC "
-                "LIMIT 50",
-                (source.get("business_line", ""), source["id"]),
-            )
+            if exclude_id:
+                cur.execute(
+                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                    "sw_version, business_line FROM alm_issues "
+                    "WHERE status IN ('open', 'analyzing') AND business_line = %s AND id != %s "
+                    "AND updated_at > NOW() - INTERVAL '90 days' "
+                    "ORDER BY updated_at DESC LIMIT 50",
+                    (business_line, exclude_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                    "sw_version, business_line FROM alm_issues "
+                    "WHERE status IN ('open', 'analyzing') AND business_line = %s "
+                    "AND updated_at > NOW() - INTERVAL '90 days' "
+                    "ORDER BY updated_at DESC LIMIT 50",
+                    (business_line,),
+                )
             rows = cur.fetchall()
-            cur.close()
-            conn.close()
+            cur.close(); conn.close()
             return [
-                {
-                    "id": r[0], "issue_no": r[1], "title": r[2],
-                    "description": r[3] or "", "dtc_snapshot": r[4] or "",
-                    "business_line": r[5] or "",
-                }
+                {"id": r[0], "issue_no": r[1], "title": r[2],
+                 "description": r[3] or "", "dtc_snapshot": r[4] or "",
+                 "model_code": r[5] or "", "sw_version": r[6] or "",
+                 "business_line": r[7] or ""}
                 for r in rows
             ]
         except Exception:
             return []
-
-    async def _load_triage_info(self, issue_id: int) -> tuple[list[str], str]:
-        """加载某个问题单的最新分诊结果（phenomena + primary_cause_code）。"""
-        import psycopg2
-        from src.core.config import get_settings
-        s = get_settings()
-        try:
-            conn = psycopg2.connect(
-                host=s.DB_HOST, port=s.DB_PORT,
-                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
-            )
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT confirmed_phenomena, primary_cause_code "
-                "FROM ai_triage_results "
-                "WHERE source_issue_id = %s "
-                "ORDER BY created_at DESC LIMIT 1",
-                (issue_id,),
-            )
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if not row:
-                return [], ""
-            import json
-            phenomena = json.loads(row[0]) if row[0] else []
-            return phenomena, row[1] or ""
-        except Exception:
-            return [], ""
-
-    def _compute_text_jaccard(self, text_a: str, text_b: str) -> float:
-        """关键词 Jaccard 相似度。"""
-        try:
-            import jieba
-            tokens_a = set(jieba.lcut(text_a))
-            tokens_b = set(jieba.lcut(text_b))
-        except ImportError:
-            tokens_a = set(text_a)
-            tokens_b = set(text_b)
-
-        if not tokens_a or not tokens_b:
-            return 0.0
-        return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
-
-    def _compute_dtc_jaccard(self, dtc_a: str, dtc_b: str) -> float:
-        """DTC 码 Jaccard 重叠。"""
-        set_a = {x.strip() for x in dtc_a.replace("，", ",").split(",") if x.strip()}
-        set_b = {x.strip() for x in dtc_b.replace("，", ",").split(",") if x.strip()}
-
-        if not set_a or not set_b:
-            return 0.0
-        return len(set_a & set_b) / len(set_a | set_b)
-
-    async def _compute_phenom_overlap(
-        self, phenoms_a: list[str], phenoms_b: list[str],
-    ) -> float:
-        """Neo4j: 计算两个现象集通过共享 RootCause 的重叠度。"""
-        if not phenoms_a or not phenoms_b:
-            return 0.0
-
-        shared = 0
-        total = len(phenoms_a) * len(phenoms_b)
-        driver = get_neo4j_driver()
-
-        try:
-            with driver.session() as session:
-                for pa in phenoms_a:
-                    for pb in phenoms_b:
-                        result = session.run(
-                            """MATCH (p1:Phenomenon {name: $pa})
-                               MATCH (p2:Phenomenon {name: $pb})
-                               MATCH (p1)<-[:INDICATES]-(rc:RootCause)-[:INDICATES]->(p2)
-                               RETURN rc.code LIMIT 1""",
-                            pa=pa, pb=pb,
-                        )
-                        if result.single():
-                            shared += 1
-        except Exception:
-            pass
-
-        return shared / max(total, 1)
 
 
 _dedup_matcher: DedupMatcher | None = None

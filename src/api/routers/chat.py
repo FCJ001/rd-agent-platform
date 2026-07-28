@@ -28,6 +28,7 @@ class ChatRequest(BaseModel):
     user_id: str = Field(..., description="用户ID")
     session_id: str = Field(..., description="会话ID（同会话多轮使用相同ID）")
     message: str = Field(..., description="用户消息")
+    role: str = Field(default="engineer", description="提问者角色：engineer/business/aftersales/customer")
 
 
 class ChatResponse(BaseModel):
@@ -87,7 +88,7 @@ async def _build_triage_deps():
     return TriageDeps(llm_json=llm_json, llm_chat=llm_chat, db_session_factory=_db_factory)
 
 
-async def _run_triage_turn(message: str, thread_id: str, redis) -> str:
+async def _run_triage_turn(message: str, thread_id: str, redis, role: str = "customer") -> str:
     """执行一轮分诊对话（绕过 Supervisor，直连 StateGraph）。"""
     active_key = f"triage_active:{thread_id}"
     state_key = f"triage_state:{thread_id}"
@@ -102,6 +103,7 @@ async def _run_triage_turn(message: str, thread_id: str, redis) -> str:
         thread_id=thread_id,
         deps=deps,
         existing_state=existing_state,
+        viewer_role=role,
     )
 
     # 收敛：保存长期记忆 → 清除 Redis 标记
@@ -133,7 +135,7 @@ async def chat(req: ChatRequest):
         # ── 分诊进行中：绕过 Supervisor ──
         if await redis.exists(active_key):
             logger.info(f"[CHAT] triage bypass user={req.user_id} session={req.session_id}")
-            reply = await _run_triage_turn(req.message, thread_id, redis)
+            reply = await _run_triage_turn(req.message, thread_id, redis, role=req.role)
             return ResponseSchema(data=ChatResponse(reply=reply, session_id=req.session_id))
 
         # ── 无活跃分诊：走 Supervisor ──
@@ -143,7 +145,7 @@ async def chat(req: ChatRequest):
         result = await agent.ainvoke(
             {"messages": [{"role": "user", "content": req.message}]},
             config=config,
-            context=UserContext(user_id=req.user_id, session_id=req.session_id),
+            context=UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role),
         )
         reply = result["messages"][-1].content
         return ResponseSchema(data=ChatResponse(reply=reply, session_id=req.session_id))
@@ -184,14 +186,14 @@ async def chat_stream(req: ChatRequest):
             # ── 分诊进行中：绕开 Supervisor，整体推送 ──
             if await redis.exists(active_key):
                 logger.info(f"[CHAT/STREAM] triage bypass user={req.user_id} session={req.session_id}")
-                reply = await _run_triage_turn(req.message, thread_id, redis)
+                reply = await _run_triage_turn(req.message, thread_id, redis, role=req.role)
                 yield _sse_frame({"type": "token", "content": reply})
 
             else:
                 # ── 无活跃分诊：Supervisor 流式推送 ──
                 agent = await get_supervisor_agent()
                 config = {"configurable": {"thread_id": thread_id}}
-                ctx = UserContext(user_id=req.user_id, session_id=req.session_id)
+                ctx = UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role)
 
                 async for chunk in agent.astream(
                     {"messages": [{"role": "user", "content": req.message}]},

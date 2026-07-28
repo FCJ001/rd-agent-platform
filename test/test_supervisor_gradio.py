@@ -15,30 +15,30 @@ BASE = "http://localhost:8000"
 # API
 # ═══════════════════════════════════════════════════════════════
 
-async def _call_chat(user_id, session_id, message):
+async def _call_chat(user_id, session_id, message, role="engineer"):
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
             f"{BASE}/api/v1/chat",
-            json={"user_id": user_id, "session_id": session_id, "message": message},
+            json={"user_id": user_id, "session_id": session_id, "message": message, "role": role},
         )
         return resp.json()["data"]["reply"]
 
 
-def call_chat(user_id, session_id, message):
+def call_chat(user_id, session_id, message, role="engineer"):
     with httpx.Client(timeout=120) as client:
         resp = client.post(
             f"{BASE}/api/v1/chat",
-            json={"user_id": user_id, "session_id": session_id, "message": message},
+            json={"user_id": user_id, "session_id": session_id, "message": message, "role": role},
         )
         return resp.json()["data"]["reply"]
 
 
-def call_chat_stream(user_id, session_id, message):
+def call_chat_stream(user_id, session_id, message, role="engineer"):
     async def _stream():
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(
                 "POST", f"{BASE}/api/v1/chat/stream",
-                json={"user_id": user_id, "session_id": session_id, "message": message},
+                json={"user_id": user_id, "session_id": session_id, "message": message, "role": role},
             ) as resp:
                 buffer = ""
                 full = ""
@@ -81,22 +81,22 @@ CASES = {
 # Handlers
 # ═══════════════════════════════════════════════════════════════
 
-def on_send(message, uid, sid, history):
+def on_send(message, uid, sid, history, role):
     if not message.strip():
-        return history, sid, None, ""
+        return history, sid, None, "", role
     if not sid:
         sid = f"s_{uuid.uuid4().hex[:6]}"
     history = list(history) if history else []
     history.append({"role": "user", "content": message})
 
-    reply = call_chat_stream(uid, sid, message)
+    reply = call_chat_stream(uid, sid, message, role)
     history.append({"role": "assistant", "content": reply})
 
     agent = _detect_agent(reply)
-    return history, sid, agent, ""
+    return history, sid, agent, "", role
 
 
-def on_quick_test(key, uid, sid, history):
+def on_quick_test(key, uid, sid, history, role):
     if key == "follow":
         pass
     else:
@@ -104,14 +104,14 @@ def on_quick_test(key, uid, sid, history):
     history = list(history) if history else []
     history.append({"role": "user", "content": CASES[key]})
 
-    reply = call_chat_stream(uid, sid, CASES[key])
+    reply = call_chat_stream(uid, sid, CASES[key], role)
     history.append({"role": "assistant", "content": reply})
 
     agent = _detect_agent(reply)
-    return history, sid, agent
+    return history, sid, agent, role
 
 
-def on_full_test(uid):
+def on_full_test(uid, role):
     lines = []
     t_total = time.time()
 
@@ -127,7 +127,7 @@ def on_full_test(uid):
     ]):
         t0 = time.time()
         sid = sid1 if key == "follow" else f"f_{uuid.uuid4().hex[:4]}"
-        reply = call_chat(uid, sid, CASES[key])
+        reply = call_chat(uid, sid, CASES[key], role)
         elapsed = time.time() - t0
         status = "\u2705" if elapsed < 30 else "\u23f3"
         lines.append(f"### {status} R{i+1}: {label}  ({elapsed:.1f}s)\n\n{reply[:400]}")
@@ -210,7 +210,11 @@ def build_ui():
         # ── Session bar ──
         with gr.Row():
             uid = gr.Textbox(label="User ID", value="test", scale=2, show_label=False, container=False)
-            sid = gr.Textbox(label="Session", placeholder="Auto-generated", scale=4, show_label=False, container=False)
+            role_dd = gr.Dropdown(
+                choices=["engineer", "business", "aftersales", "customer"],
+                value="engineer", label="", show_label=False, scale=1, container=False,
+            )
+            sid = gr.Textbox(label="Session", placeholder="Auto-generated", scale=3, show_label=False, container=False)
             new_btn = gr.Button("\u65b0\u4f1a\u8bdd", size="sm", scale=1)
             clear_btn = gr.Button("\u6e05\u5c4f", size="sm", scale=1)
 
@@ -246,17 +250,17 @@ def build_ui():
             )
 
         # ── Events ──
-        msg.submit(on_send, [msg, uid, sid, chatbot], [chatbot, sid, agent_label, msg])
+        msg.submit(on_send, [msg, uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, msg, role_dd])
 
-        btn_triage.click(lambda u, s, h: on_quick_test("triage", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
-        btn_impact.click(lambda u, s, h: on_quick_test("impact", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
-        btn_report.click(lambda u, s, h: on_quick_test("report", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
-        btn_memory.click(lambda u, s, h: on_quick_test("memory", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
-        btn_dedup.click(lambda u, s, h: on_quick_test("dedup", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
+        btn_triage.click(lambda u, s, h, r: on_quick_test("triage", u, s, h, r), [uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, role_dd])
+        btn_impact.click(lambda u, s, h, r: on_quick_test("impact", u, s, h, r), [uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, role_dd])
+        btn_report.click(lambda u, s, h, r: on_quick_test("report", u, s, h, r), [uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, role_dd])
+        btn_memory.click(lambda u, s, h, r: on_quick_test("memory", u, s, h, r), [uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, role_dd])
+        btn_dedup.click(lambda u, s, h, r: on_quick_test("dedup", u, s, h, r), [uid, sid, chatbot, role_dd], [chatbot, sid, agent_label, role_dd])
 
         clear_btn.click(lambda: ([], "", "\u5c31\u7eea"), inputs=[], outputs=[chatbot, sid, agent_label])
 
-        btn_full.click(on_full_test, [uid], [full_output])
+        btn_full.click(on_full_test, [uid, role_dd], [full_output])
 
     return demo
 

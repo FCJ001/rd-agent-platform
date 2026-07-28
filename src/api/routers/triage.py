@@ -100,3 +100,48 @@ async def triage(req: TriageRequest):
     )
 
     return ResponseSchema(data=triage_result)
+
+
+# ── 反馈回写 API ────────────────────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    session_id: str = Field(..., description="分诊会话 ID")
+    adopted: bool = Field(..., description="是否采纳诊断结论")
+    comment: str | None = Field(None, description="反馈备注（如不采纳原因）")
+
+
+class FeedbackResult(BaseModel):
+    session_id: str
+    updated: bool
+
+
+@router.post("/feedback", response_model=ResponseSchema[FeedbackResult])
+async def submit_feedback(req: FeedbackRequest):
+    """
+    分诊反馈回写接口。
+
+    人工确认诊断结论是否准确，回写到 ai_triage_results.adopted 字段，
+    用于统计分诊准确率、优化知识库。
+    """
+    import json
+    from sqlalchemy import text as sa_text
+    from src.infra.db import AsyncSessionLocal
+
+    logger.info(f"[TRIAGE-FB] session={req.session_id} adopted={req.adopted}")
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            sa_text(
+                "UPDATE ai_triage_results SET adopted = :adopted, feedback_comment = :comment, "
+                "updated_at = NOW() WHERE session_id = :session_id"
+            ),
+            {
+                "adopted": req.adopted,
+                "comment": req.comment,
+                "session_id": req.session_id,
+            },
+        )
+        await db.commit()
+        updated = result.rowcount > 0
+
+    return ResponseSchema(data=FeedbackResult(session_id=req.session_id, updated=updated))

@@ -15,6 +15,7 @@ from src.infra.redis_cache import get_checkpointer_redis
 class UserContext:
     user_id: str
     session_id: str
+    role: str = "engineer"  # engineer/business/aftersales/customer
 
 
 @tool
@@ -28,6 +29,7 @@ async def call_triage_agent(message: str, runtime: ToolRuntime[UserContext]) -> 
     """
     session_id = runtime.context.session_id
     user_id = runtime.context.user_id
+    role = runtime.context.role
 
     agent = TriageAgent()
     deps = agent._build_deps()
@@ -38,6 +40,7 @@ async def call_triage_agent(message: str, runtime: ToolRuntime[UserContext]) -> 
         thread_id=f"{user_id}:{session_id}",
         deps=deps,
         existing_state=None,
+        viewer_role=role,
     )
 
     # 首轮即收敛 → 直接返回结论
@@ -112,13 +115,15 @@ async def call_dedup_check(message: str, runtime: ToolRuntime[UserContext] = Non
 
     lines = [f"发现 {len(result.matches)} 个可能重复的问题单：\n"]
     for i, m in enumerate(result.matches, 1):
+        evidence_map = {
+            "model_and_sw": "车型+软件版本一致",
+            "dtc": "DTC故障码重叠",
+            "model_and_sw+dtc": "车型+软件版本一致 且 DTC故障码重叠",
+        }
         lines.append(
             f"### {i}. {m.issue_no}: {m.title}\n"
-            f"- 综合得分: {m.combined_score:.2%}\n"
-            f"- 文本相似度: {m.text_similarity:.2%}\n"
-            f"- DTC 重叠度: {m.dtc_overlap:.2%}\n"
-            f"- 现象重叠度: {m.phenom_overlap:.2%}\n"
-            f"- 根因匹配: {'是' if m.root_cause_match > 0 else '否'}\n"
+            f"- 向量相似度: {m.similarity:.2%}\n"
+            f"- 匹配证据: {evidence_map.get(m.evidence, m.evidence)}\n"
         )
     lines.append("\n建议先查看以上问题单的已有诊断结论，确认是否确为重复。")
     return "\n".join(lines)

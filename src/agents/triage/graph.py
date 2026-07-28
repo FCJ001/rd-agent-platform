@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.agents.triage.state import TriageState, TriagePhase, CandidateCause
 from src.agents.triage.prompts import (
     EXTRACT_PHENOMENA_PROMPT, ASK_DETAILS_PROMPT,
-    PARSE_ANSWER_PROMPT, CONCLUSION_PROMPT,
+    PARSE_ANSWER_PROMPT, ROLE_PROMPTS,
 )
 from src.agents.triage.db_queries import (
     load_issue_context, match_phenomena_by_names,
@@ -94,11 +94,15 @@ async def node_load_issue(state: TriageState, deps: TriageDeps) -> dict:
         try:
             ctx = await load_issue_context(db, state.issue_id)
             if ctx:
-                return {
+                result = {
                     "issue_title": ctx["issue_title"],
                     "issue_desc": ctx["issue_desc"],
                     "issue_dtc_snapshot": ctx["issue_dtc_snapshot"],
                 }
+                # 如果调用者未指定角色，用 issue 原始来源作为 fallback
+                if not state.viewer_role or state.viewer_role == "customer":
+                    result["viewer_role"] = ctx.get("source", "customer")
+                return result
             return {}
         finally:
             break
@@ -287,7 +291,7 @@ async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
     suspected = [f"{c.name}({c.confidence:.0%})" for c in candidates[1:5]]
     confidence = top1.confidence
 
-    prompt = CONCLUSION_PROMPT.format(
+    prompt = ROLE_PROMPTS.get(state.viewer_role, ROLE_PROMPTS["customer"]).format(
         confirmed_phenomena="、".join(state.confirmed_phenomena) or "暂无",
         denied_phenomena="、".join(state.denied_phenomena) or "暂无",
         dtc_codes="、".join(state.dtc_codes) or "无",
@@ -410,6 +414,7 @@ async def run_triage(
     thread_id: str,
     deps: TriageDeps,
     existing_state: TriageState | None = None,
+    viewer_role: str = "customer",
 ) -> tuple[str, TriageState]:
     """
     执行一轮分诊对话。
@@ -419,6 +424,7 @@ async def run_triage(
         thread_id: 会话标识（用于关联 Redis 状态）
         deps: 依赖注入容器
         existing_state: 上一轮的状态（多轮对话时传入）
+        viewer_role: 查看结论的人的角色（engineer/business/aftersales/customer），影响输出格式
 
     Returns:
         (assistant_reply, new_state)
@@ -429,12 +435,14 @@ async def run_triage(
         state = TriageState(
             session_id=thread_id,
             phenomenon_vocabulary=vocabulary,
+            viewer_role=viewer_role,
         )
     else:
         state = existing_state.model_copy()
         state.round = existing_state.round + 1
         state.phase = TriagePhase.EXTRACT
         state.phenomenon_vocabulary = vocabulary
+        state.viewer_role = viewer_role
 
     state.messages.append(HumanMessage(content=user_message))
 

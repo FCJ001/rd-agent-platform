@@ -252,10 +252,30 @@ class AiTriageResult(BaseModel):
     # ★ 复盘用：轮次耗尽强制收敛的比例，是评估图谱质量的核心指标
     force_conclude: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否轮次耗尽强制收敛")
     adopted: Mapped[bool | None] = mapped_column(Boolean, comment="人工是否采纳（None=未反馈），准确率统计口径")
+    feedback_comment: Mapped[str | None] = mapped_column(Text, comment="人工反馈备注")
 
     __table_args__ = (
         Index("ix_triage_session", "session_id"),
         Index("ix_triage_issue", "source_issue_id"),
+    )
+
+
+class AiDedupLink(BaseModel):
+    """去重链接 —— 记录问题单之间的重复判定"""
+
+    __tablename__ = "ai_dedup_links"
+
+    source_issue_id: Mapped[int] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), nullable=False, comment="源问题单 ID")
+    matched_issue_id: Mapped[int] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), nullable=False, comment="被匹配的重复问题单 ID")
+    similarity: Mapped[float] = mapped_column(Float, default=0.0, comment="向量余弦相似度")
+    evidence: Mapped[str] = mapped_column(String(50), nullable=False, comment="匹配证据：model_and_sw / dtc / model_and_sw+dtc")
+    is_duplicate: Mapped[bool] = mapped_column(Boolean, default=True, comment="是否判定为重复")
+    reviewed: Mapped[bool | None] = mapped_column(Boolean, comment="人工复核结果（None=未复核）")
+
+    __table_args__ = (
+        UniqueConstraint("source_issue_id", "matched_issue_id", name="uq_dedup_link"),
+        Index("ix_dedup_source", "source_issue_id"),
+        Index("ix_dedup_matched", "matched_issue_id"),
     )
 
 
