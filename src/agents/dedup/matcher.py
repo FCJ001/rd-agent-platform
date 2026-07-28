@@ -34,48 +34,122 @@ class DedupMatcher:
         """检测指定问题单是否与已有问题重复。"""
         result = DedupResult(source_issue_id=issue_id)
 
-        # 加载源问题单
         source = await self._load_issue(issue_id)
         if not source:
             return result
 
-        # 加载候选问题单（同业务线、open/analyzing、近90天）
         candidates = await self._load_candidates(source)
         if not candidates:
             return result
 
-        # 获取源问题单的 triage 信息
         source_phenomena, source_rc = await self._load_triage_info(issue_id)
+
+        await self._score_candidates(result, source, candidates, source_phenomena, source_rc)
+        return result
+
+    async def detect_by_text(
+        self, description: str, dtc_codes: str = "", business_line: str = "ia",
+    ) -> DedupResult:
+        """根据文本描述搜索重复问题（无需 issue_id）。"""
+        import psycopg2
+        from src.core.config import get_settings
+
+        result = DedupResult(source_issue_id=0)
+        s = get_settings()
+
+        try:
+            conn = psycopg2.connect(
+                host=s.DB_HOST, port=s.DB_PORT,
+                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
+            )
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, issue_no, title, description, dtc_snapshot, business_line "
+                "FROM alm_issues "
+                "WHERE status IN ('open', 'analyzing') "
+                "  AND business_line = %s "
+                "  AND updated_at > NOW() - INTERVAL '90 days' "
+                "ORDER BY updated_at DESC "
+                "LIMIT 50",
+                (business_line,),
+            )
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            candidates = [
+                {
+                    "id": r[0], "issue_no": r[1], "title": r[2],
+                    "description": r[3] or "", "dtc_snapshot": r[4] or "",
+                    "business_line": r[5] or "",
+                }
+                for r in rows
+            ]
+        except Exception:
+            return result
+
+        if not candidates:
+            return result
+
+        source = {"title": description, "description": "", "dtc_snapshot": dtc_codes}
+
+        # Extract phenomena from description (simple keyword extraction)
+        source_phenomena = await self._extract_phenomena_keywords(description)
+        source_rc = ""
+
+        await self._score_candidates(result, source, candidates, source_phenomena, source_rc)
+        return result
+
+    async def _extract_phenomena_keywords(self, text: str) -> list[str]:
+        """从文本中提取可能的现象关键词（简单匹配 phenomena 表）。"""
+        import psycopg2
+        from src.core.config import get_settings
+        s = get_settings()
+        try:
+            conn = psycopg2.connect(
+                host=s.DB_HOST, port=s.DB_PORT,
+                user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
+            )
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM phenomena ORDER BY id")
+            all_phenomena = [r[0] for r in cur.fetchall()]
+            cur.close()
+            conn.close()
+
+            return [p for p in all_phenomena if p in text]
+        except Exception:
+            return []
+
+    async def _score_candidates(
+        self, result: DedupResult, source: dict, candidates: list[dict],
+        source_phenomena: list[str], source_rc: str,
+    ):
+        """对候选列表打分，筛选重复项。"""
+        source_id = source.get("id", 0)
 
         for cand in candidates:
             cand_id = cand["id"]
-            if cand_id == issue_id:
+            if cand_id == source_id:
                 continue
 
-            # 获取候选问题单的 triage 信息
             cand_phenomena, cand_rc = await self._load_triage_info(cand_id)
 
-            # 信号1: 文本相似度（关键词 Jaccard）
             text_sim = self._compute_text_jaccard(
                 f"{source.get('title', '')} {source.get('description', '')}",
                 f"{cand.get('title', '')} {cand.get('description', '')}",
             )
 
-            # 信号2: DTC 重叠
             dtc_sim = self._compute_dtc_jaccard(
                 source.get("dtc_snapshot", ""),
                 cand.get("dtc_snapshot", ""),
             )
 
-            # 信号3: 现象重叠（Neo4j: 共享 RootCause 的 phenomena）
             phenom_sim = await self._compute_phenom_overlap(
                 source_phenomena, cand_phenomena,
             )
 
-            # 信号4: 根因匹配
             rc_match = 1.0 if source_rc and cand_rc and source_rc == cand_rc else 0.0
 
-            # 加权综合得分
             combined = (
                 0.30 * text_sim +
                 0.25 * dtc_sim +
@@ -97,7 +171,6 @@ class DedupMatcher:
 
         result.matches.sort(key=lambda x: x.combined_score, reverse=True)
         result.is_duplicate = len(result.matches) > 0
-        return result
 
     async def _load_issue(self, issue_id: int) -> dict | None:
         """从 PG 加载问题单数据。"""

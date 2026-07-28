@@ -84,4 +84,44 @@ async def call_report_agent(message: str, report_type: str = "DTC扫描", runtim
     return await agent.analyze(message, report_type)
 
 
-WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent]
+@tool
+async def call_dedup_check(message: str, runtime: ToolRuntime[UserContext] = None) -> str:
+    """检查新问题是否与已有问题重复。
+    适用场景：用户报告新故障后，检查是否存在类似的未关闭问题单。
+    如果发现重复，直接返回已有诊断结论，避免重复劳动。
+
+    Args:
+        message: 用户的问题描述（原文传递）
+    """
+    from src.agents.dedup.matcher import DedupMatcher
+    from src.core.logger import logger
+
+    logger.info(f"[DEDUP] call_dedup_check 被调用, message={message[:80]}")
+
+    # Extract DTC codes from message
+    import re
+    dtc_codes = ",".join(re.findall(r"[A-Z]\d{4,5}", message))
+
+    matcher = DedupMatcher()
+    result = await matcher.detect_by_text(message, dtc_codes)
+
+    logger.info(f"[DEDUP] 检测完成, is_duplicate={result.is_duplicate}, matches={len(result.matches)}")
+
+    if not result.is_duplicate:
+        return "未发现重复的未关闭问题单，可以继续诊断。"
+
+    lines = [f"发现 {len(result.matches)} 个可能重复的问题单：\n"]
+    for i, m in enumerate(result.matches, 1):
+        lines.append(
+            f"### {i}. {m.issue_no}: {m.title}\n"
+            f"- 综合得分: {m.combined_score:.2%}\n"
+            f"- 文本相似度: {m.text_similarity:.2%}\n"
+            f"- DTC 重叠度: {m.dtc_overlap:.2%}\n"
+            f"- 现象重叠度: {m.phenom_overlap:.2%}\n"
+            f"- 根因匹配: {'是' if m.root_cause_match > 0 else '否'}\n"
+        )
+    lines.append("\n建议先查看以上问题单的已有诊断结论，确认是否确为重复。")
+    return "\n".join(lines)
+
+
+WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent, call_dedup_check]

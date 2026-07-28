@@ -73,6 +73,7 @@ CASES = {
     "impact":  "分析变更影响：升级网关MCU固件到v3.2.1，目标基线2025Q3",
     "report":  "解读台架测试报告：电池SOH 72%，单体压差 85mV，HMI冷启动 9200ms，绝缘电阻 0.5M\u03A9",
     "memory":  "上个月也出现过黑屏问题，帮我查下之前的诊断结果",
+    "dedup":   "车机中控屏黑屏，系统响应慢，DTC码U0100",
 }
 
 
@@ -117,6 +118,7 @@ def on_full_test(uid):
     sid1 = f"f_{uuid.uuid4().hex[:4]}"
 
     for i, (label, key) in enumerate([
+        ("Dedup \u53bb\u91cd\u68c0\u6d4b", "dedup"),
         ("Triage \u5206\u8bca", "triage"),
         ("Triage \u8ffd\u95ee (bypass)", "follow"),
         ("Memory \u8bb0\u5fc6\u53ec\u56de", "memory"),
@@ -232,6 +234,7 @@ def build_ui():
                 btn_impact = gr.Button("\U0001f4ca \u53d8\u66f4\u5f71\u54cd\u5206\u6790", variant="secondary")
                 btn_report = gr.Button("\U0001f4cb \u62a5\u544a\u89e3\u8bfb", variant="secondary")
                 btn_memory = gr.Button("\U0001f9e0 \u8de8\u4f1a\u8bdd\u8bb0\u5fc6", variant="secondary")
+                btn_dedup = gr.Button("\U0001f50d \u95ee\u9898\u53bb\u91cd\u68c0\u6d4b", variant="secondary")
                 btn_full = gr.Button("\u25b6 \u4e00\u952e\u5b8c\u6574\u6d41\u7a0b", variant="primary")
 
         # ── Full test output ──
@@ -249,6 +252,7 @@ def build_ui():
         btn_impact.click(lambda u, s, h: on_quick_test("impact", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
         btn_report.click(lambda u, s, h: on_quick_test("report", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
         btn_memory.click(lambda u, s, h: on_quick_test("memory", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
+        btn_dedup.click(lambda u, s, h: on_quick_test("dedup", u, s, h), [uid, sid, chatbot], [chatbot, sid, agent_label])
 
         clear_btn.click(lambda: ([], "", "\u5c31\u7eea"), inputs=[], outputs=[chatbot, sid, agent_label])
 
