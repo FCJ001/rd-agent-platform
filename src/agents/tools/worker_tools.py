@@ -121,4 +121,6 @@ async def call_dedup_check(message: str, runtime: ToolRuntime[UserContext] = Non
     return "\n".join(lines)
 
 
-WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent, call_dedup_check]
+from src.agents.tools.remote_knowledge import REMOTE_TOOLS
+
+WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent, call_dedup_check] + REMOTE_TOOLS
