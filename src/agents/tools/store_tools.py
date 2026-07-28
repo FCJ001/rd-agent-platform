@@ -5,6 +5,8 @@ import time
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
+from src.core.logger import logger
+
 
 def _get_user_id(runtime: ToolRuntime) -> str | None:
     """从 thread_id 中提取用户 ID。thread_id 格式: {user_id}:{session_id}"""
@@ -28,6 +30,7 @@ async def save_memory(content: str, runtime: ToolRuntime) -> str:
         return "无法获取用户ID。"
 
     key = f"memory_{int(time.time())}"
+    logger.info(f"[MEM] save_memory user={user_id} content={content[:80]}")
     await runtime.store.aput(
         namespace=("users", user_id, "memories"),
         key=key,
@@ -48,11 +51,13 @@ async def search_memory(query: str, runtime: ToolRuntime) -> str:
     if not user_id:
         return "无法获取用户ID。"
 
+    logger.info(f"[MEM] search_memory user={user_id} query={query[:80]}")
     results = await runtime.store.asearch(
         ("users", user_id, "memories"),
         query=query,
         limit=5,
     )
+    logger.info(f"[MEM] search_memory results={len(results)}")
     if not results:
         return "没有找到相关记忆。"
 

@@ -24,6 +24,9 @@ logs/
 data/raw/
 data/eval/
 
+# 面试准备文档（不提交）
+interview/
+
 # IDE
 .idea/
 .vscode/

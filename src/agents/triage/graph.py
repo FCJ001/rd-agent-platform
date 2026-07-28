@@ -21,6 +21,7 @@ from src.agents.triage.db_queries import (
 from src.agents.triage.graph_queries import query_causes_by_phenomena, enrich_cause_details
 from src.agents.triage.confidence import apply_context_weights, check_convergence, MAX_ROUNDS
 from src.core.config import get_settings
+from src.core.logger import logger
 
 
 settings = get_settings()
@@ -90,6 +91,7 @@ async def node_load_issue(state: TriageState, deps: TriageDeps) -> dict:
     if state.round > 0 or not state.issue_id:
         return {}
 
+    logger.info(f"[TRIAGE] 节点① load_issue id={state.issue_id} round={state.round}")
     async for db in deps.db_session_factory():
         try:
             ctx = await load_issue_context(db, state.issue_id)
@@ -99,9 +101,9 @@ async def node_load_issue(state: TriageState, deps: TriageDeps) -> dict:
                     "issue_desc": ctx["issue_desc"],
                     "issue_dtc_snapshot": ctx["issue_dtc_snapshot"],
                 }
-                # 如果调用者未指定角色，用 issue 原始来源作为 fallback
                 if not state.viewer_role or state.viewer_role == "customer":
                     result["viewer_role"] = ctx.get("source", "customer")
+                logger.info(f"[TRIAGE] 节点① issue_loaded title={ctx['issue_title'][:50]} viewer_role={result.get('viewer_role')}")
                 return result
             return {}
         finally:
@@ -114,6 +116,7 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
     if not last_msg:
         return {"phase": TriagePhase.ASK}
 
+    logger.info(f"[TRIAGE] 节点② extract_phenomena round={state.round} last_msg={last_msg[:60]}")
     # 构建用户输入（含问题单上下文）
     user_input = last_msg
     if state.issue_title and state.round == 0:
@@ -132,8 +135,11 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
         new_phenomena = parsed.get("phenomena", [])
         new_dtc = parsed.get("dtc_codes", [])
     except Exception:
+        logger.warning(f"[TRIAGE] 节点② LLM JSON 解析失败")
         new_phenomena = []
         new_dtc = []
+
+    logger.info(f"[TRIAGE] 节点② extracted phenomena={new_phenomena} dtc={new_dtc}")
 
     # Merge with existing
     all_confirmed = list(set(state.confirmed_phenomena) | set(new_phenomena))
@@ -154,6 +160,7 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
 
 async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
     """节点③：L2 DB 匹配现象名→id + L3 Neo4j 查询候选根因 + 置信度计算。"""
+    logger.info(f"[TRIAGE] 节点③ query_candidates confirmed={state.confirmed_phenomena} dtc={state.dtc_codes}")
     # Step 1: DB match phenomenon names → IDs
     async for db in deps.db_session_factory():
         try:
@@ -163,19 +170,19 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
             break
 
     if not matched:
+        logger.info(f"[TRIAGE] 节点③ 无匹配现象 → force_conclude")
         return {"phase": TriagePhase.CONCLUDE, "force_conclude": True}
 
     # Step 2: Neo4j query candidate root causes
     phenom_names = [m["name"] for m in matched]
     candidates = query_causes_by_phenomena(phenom_names)
+    logger.info(f"[TRIAGE] 节点③ matched_phenomena={phenom_names} neo4j_candidates={len(candidates)}")
 
     if candidates:
         candidates = enrich_cause_details(candidates)
 
-        # Step 3: DTC matching (check if candidate's KG dtc_codes match user's dtc)
         if state.dtc_codes:
             for c in candidates:
-                # Load dtc_codes from KG via init data - check each cause's phenomena_meta
                 pass  # dtc matching is handled in graph_queries.enrich_cause_details
 
         candidates = apply_context_weights(
@@ -183,6 +190,7 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
         )
 
     should_conclude, force_conclude = check_convergence(candidates, state.round)
+    logger.info(f"[TRIAGE] 节点③ should_conclude={should_conclude} force={force_conclude} top_confidence={candidates[0].confidence if candidates else 0}")
 
     if should_conclude:
         return {
@@ -206,6 +214,7 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
 
 async def node_ask_details(state: TriageState, deps: TriageDeps) -> dict:
     """节点④：LLM 生成追问（问伴随现象、DTC、发生条件、频次）。"""
+    logger.info(f"[TRIAGE] 节点④ ask_details round={state.round} candidates={len(state.candidate_causes)}")
     candidate_summary = "\n".join(
         f"- {c.name}（置信度 {c.confidence:.0%}，匹配现象: {', '.join(c.matched_phenomena)}"
         f"{'，未命中: ' + ', '.join([p for p in c.all_phenomena if p not in c.matched_phenomena]) if c.all_phenomena else ''}"
@@ -243,6 +252,7 @@ async def node_parse_answer(state: TriageState, deps: TriageDeps) -> dict:
     if not last_msg:
         return {}
 
+    logger.info(f"[TRIAGE] 节点⑤ parse_answer round={state.round} answer={last_msg[:80]}")
     asked = state.follow_up_questions[-1] if state.follow_up_questions else "请描述更多故障细节"
 
     prompt = PARSE_ANSWER_PROMPT.format(
@@ -278,6 +288,7 @@ async def node_parse_answer(state: TriageState, deps: TriageDeps) -> dict:
 
 async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
     """节点⑥：生成诊断结论 + 存入 ai_triage_results。"""
+    logger.info(f"[TRIAGE] 节点⑥ conclude round={state.round} candidates={len(state.candidate_causes)} viewer_role={state.viewer_role}")
     candidates = state.candidate_causes
     if not candidates:
         no_result = "根据您描述的故障现象，暂未在知识库中找到高置信度匹配的根因。建议实车诊断确认。"

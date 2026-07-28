@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from langchain_community.embeddings import DashScopeEmbeddings
 
 from src.core.config import get_settings
+from src.core.logger import logger
 
 settings = get_settings()
 
@@ -67,11 +68,14 @@ class DedupMatcher:
 
     async def detect(self, issue_id: int) -> DedupResult:
         """检测指定问题单是否与已有问题重复。"""
+        logger.info(f"[DEDUP] detect issue_id={issue_id}")
         source = await self._load_issue_full(issue_id)
         if not source:
+            logger.warning(f"[DEDUP] issue_id={issue_id} not found")
             return DedupResult(source_issue_id=issue_id)
 
         candidates = await self._load_candidates_full(source["business_line"], exclude_id=issue_id)
+        logger.info(f"[DEDUP] candidates loaded: {len(candidates)}")
         return await self._match(source, candidates, issue_id)
 
     async def detect_by_text(
@@ -94,6 +98,7 @@ class DedupMatcher:
         self, source: dict, candidates: list[dict], source_id: int,
     ) -> DedupResult:
         """双门槛匹配逻辑。"""
+        logger.info(f"[DEDUP] _match source_id={source_id} candidates={len(candidates)}")
         result = DedupResult(source_issue_id=source_id)
         if not candidates:
             return result
@@ -107,6 +112,7 @@ class DedupMatcher:
         try:
             source_emb = self.embedding_model.embed_query(source_text)
         except Exception:
+            logger.warning(f"[DEDUP] embedding failed for source_id={source_id}")
             return result
 
         for cand in candidates:
@@ -154,6 +160,9 @@ class DedupMatcher:
 
         result.matches.sort(key=lambda x: x.similarity, reverse=True)
         result.is_duplicate = len(result.matches) > 0
+
+        logger.info(f"[DEDUP] _match result is_duplicate={result.is_duplicate} matches={len(result.matches)} "
+                    f"top_similarity={result.matches[0].similarity if result.matches else 0}")
 
         # ── 持久化到 ai_dedup_links ──
         if result.is_duplicate and source_id > 0:

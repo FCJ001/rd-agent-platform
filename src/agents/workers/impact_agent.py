@@ -3,6 +3,7 @@
 from functools import lru_cache
 
 from src.agents.impact.review import analyze_impact
+from src.core.logger import logger
 
 
 class ImpactAgent:
@@ -10,7 +11,10 @@ class ImpactAgent:
 
     async def analyze(self, change_description: str) -> str:
         """执行变更影响分析，返回 Markdown 报告。"""
-        return await analyze_impact(change_description)
+        logger.info(f"[IMPACT] analyze start input={change_description[:80]}")
+        result = await analyze_impact(change_description)
+        logger.info(f"[IMPACT] analyze done len={len(result)}")
+        return result
 
 
 @lru_cache(maxsize=1)

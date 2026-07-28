@@ -3,6 +3,7 @@
 from functools import lru_cache
 
 from src.agents.report.parser import analyze_report
+from src.core.logger import logger
 
 
 class ReportAgent:
@@ -10,7 +11,10 @@ class ReportAgent:
 
     async def analyze(self, report_text: str, report_type: str = "DTC扫描") -> str:
         """解析并解读一份报告，返回结构化解读。"""
-        return await analyze_report(report_text, report_type)
+        logger.info(f"[REPORT] analyze type={report_type} text_len={len(report_text)}")
+        result = await analyze_report(report_text, report_type)
+        logger.info(f"[REPORT] analyze done len={len(result)}")
+        return result
 
 
 @lru_cache(maxsize=1)
