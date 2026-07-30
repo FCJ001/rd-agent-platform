@@ -1,4 +1,4 @@
-"""分诊 StateGraph。参考天宫医疗版 inquiry/graph.py（10 节点 → 7 节点精简）。"""
+"""分诊 StateGraph。参考天宫医疗版 inquiry/graph.py（10 节点拓扑）。"""
 
 import json
 import uuid
@@ -156,6 +156,44 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
             "dtc_codes": all_dtc,
             "phase": TriagePhase.ASK,
         }
+
+
+# 安全关键词：涉及高压电、制动、转向等 — 检测到立即警示
+SAFETY_KEYWORDS = [
+    "起火", "冒烟", "制动失效", "制动失灵", "刹车失灵", "转向失控",
+    "高压电", "高压漏电", "电池起火", "电池冒烟", "气囊失效",
+    "油门失控", "突然加速", "无法减速",
+]
+
+
+async def node_check_safety(state: TriageState, deps: TriageDeps) -> dict:
+    """节点②b：安全关键词检测。命中则立即返回安全警示，终止诊断。"""
+    last_msg = _get_last_human_message(state.messages)
+    combined = f"{' '.join(state.confirmed_phenomena)} {' '.join(state.dtc_codes)} {last_msg}"
+    emergency_hit = None
+    for kw in SAFETY_KEYWORDS:
+        if kw in combined:
+            emergency_hit = kw
+            break
+
+    if not emergency_hit:
+        return {}
+
+    logger.warning(f"[TRIAGE] 节点check_safety 命中安全关键词: {emergency_hit}")
+    warning = (
+        f"## ⚠️ 安全警示\n\n"
+        f'您的描述中涉及「{emergency_hit}」，属于高安全风险项。\n\n'
+        f"**请立即采取以下措施：**\n"
+        f"1. 如车辆正在行驶，请靠边停车，人员撤离到安全区域\n"
+        f"2. 联系道路救援或品牌售后紧急热线\n"
+        f"3. 在专业人员到达前，请勿自行检修高压/制动/转向系统\n\n"
+        f"车辆停稳后，您可以继续描述故障详情，AI 助手将协助初步诊断。"
+    )
+    return {
+        "phase": TriagePhase.END,
+        "diagnostic_summary": warning,
+        "messages": [AIMessage(content=warning)],
+    }
 
 
 async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
@@ -326,7 +364,24 @@ async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
             '\n直接回复「创建」、「跳转」或「结案」，或者描述具体需求即可。'
         )
 
-    # Save to DB
+    return {
+        "phase": TriagePhase.CONCLUDE,
+        "diagnostic_summary": summary,
+        "confidence": confidence,
+        "primary_cause_code": top1.code,
+        "messages": [AIMessage(content=summary)],
+    }
+
+
+async def node_save_record(state: TriageState, deps: TriageDeps) -> dict:
+    """节点⑦：持久化诊断结论到 ai_triage_results。"""
+    candidates = state.candidate_causes
+    if not candidates:
+        return {}
+
+    top1 = candidates[0]
+    confidence = top1.confidence
+
     async for db in deps.db_session_factory():
         try:
             await save_triage_result(db, {
@@ -346,12 +401,8 @@ async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
         finally:
             break
 
-    return {
-        "phase": TriagePhase.CONCLUDE,
-        "diagnostic_summary": summary,
-        "confidence": confidence,
-        "messages": [AIMessage(content=summary)],
-    }
+    logger.info(f"[TRIAGE] 节点⑦ save_record done cause={top1.code} confidence={confidence:.0%}")
+    return {"phase": TriagePhase.END}
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -366,7 +417,14 @@ def route_dispatcher(state: TriageState) -> str:
 
 
 def route_after_extract(state: TriageState) -> str:
-    """现象提取后：有现象→query_candidates，无现象→ask_details。"""
+    """现象提取后 → check_safety。"""
+    return "check_safety"
+
+
+def route_after_check_safety(state: TriageState) -> str:
+    """安全检查后：紧急→END，安全→query_candidates 或 ask_details。"""
+    if state.phase == TriagePhase.END:
+        return "end"
     if state.phase == TriagePhase.QUERY:
         return "query_candidates"
     return "ask_details"
@@ -379,35 +437,46 @@ def route_after_query(state: TriageState) -> str:
     return "ask_details"
 
 
+def route_after_conclude(state: TriageState) -> str:
+    """诊断结论后：有候选→save_record，否则→END。"""
+    if state.candidate_causes:
+        return "save_record"
+    return "end"
+
+
 # ════════════════════════════════════════════════════════════════════════
 # 图组装
 # ════════════════════════════════════════════════════════════════════════
 
 def build_triage_graph(deps: TriageDeps):
-    """构建并编译分诊 StateGraph。"""
+    """构建并编译分诊 StateGraph（10 节点拓扑）。"""
     async def _load_issue(state):       return await node_load_issue(state, deps)
     async def _extract_phenomena(state): return await node_extract_phenomena(state, deps)
+    async def _check_safety(state):     return await node_check_safety(state, deps)
     async def _query_candidates(state):  return await node_query_candidates(state, deps)
     async def _ask_details(state):       return await node_ask_details(state, deps)
     async def _parse_answer(state):      return await node_parse_answer(state, deps)
     async def _conclude(state):          return await node_conclude(state, deps)
+    async def _save_record(state):       return await node_save_record(state, deps)
 
     graph = StateGraph(TriageState)
 
     graph.add_node("dispatcher", lambda state: {})
     graph.add_node("load_issue", _load_issue)
     graph.add_node("extract_phenomena", _extract_phenomena)
+    graph.add_node("check_safety", _check_safety)
     graph.add_node("query_candidates", _query_candidates)
     graph.add_node("ask_details", _ask_details)
     graph.add_node("parse_answer", _parse_answer)
     graph.add_node("conclude", _conclude)
+    graph.add_node("save_record", _save_record)
 
     graph.set_entry_point("dispatcher")
 
     # 固定边
     graph.add_edge("load_issue", "extract_phenomena")
     graph.add_edge("ask_details", END)
-    graph.add_edge("conclude", END)
+    graph.add_edge("save_record", END)
 
     # 条件边
     graph.add_conditional_edges("dispatcher", route_dispatcher, {
@@ -415,12 +484,20 @@ def build_triage_graph(deps: TriageDeps):
         "parse_answer": "parse_answer",
     })
     graph.add_conditional_edges("extract_phenomena", route_after_extract, {
+        "check_safety": "check_safety",
+    })
+    graph.add_conditional_edges("check_safety", route_after_check_safety, {
         "query_candidates": "query_candidates",
         "ask_details": "ask_details",
+        "end": END,
     })
     graph.add_conditional_edges("query_candidates", route_after_query, {
         "conclude": "conclude",
         "ask_details": "ask_details",
+    })
+    graph.add_conditional_edges("conclude", route_after_conclude, {
+        "save_record": "save_record",
+        "end": END,
     })
     graph.add_edge("parse_answer", "extract_phenomena")
 

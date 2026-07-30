@@ -144,4 +144,96 @@ def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCaus
     except Exception:
         pass  # verify_items is optional enrichment
 
+    # Load LOCATED_IN relationships from Neo4j
+    try:
+        located_in = query_located_in(cause_codes)
+        for c in candidates:
+            if c.code in located_in:
+                c.related_config_items = located_in[c.code]
+    except Exception:
+        pass
+
+    # Load CO_OCCURS_WITH relationships from Neo4j
+    try:
+        co_occurs = query_co_occurs_with(cause_codes)
+        for c in candidates:
+            if c.code in co_occurs:
+                c.related_causes = [
+                    f"{r['name']}({r['domain']})" for r in co_occurs[c.code]
+                ]
+    except Exception:
+        pass
+
     return candidates
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Neo4j 关系查询（补充 DTC/LOCATED_IN/CO_OCCURS_WITH 关系模型）
+# ════════════════════════════════════════════════════════════════════════
+
+def query_dtc_by_relationship(cause_codes: list[str]) -> dict[str, list[str]]:
+    """
+    查询 DTC 码（通过 (:DTC)-[:POINTS_TO]->(:RootCause) 关系）。
+    返回 {cause_code: [dtc_code, ...]} 映射。
+    """
+    if not cause_codes:
+        return {}
+
+    driver = get_neo4j_driver()
+    cypher = """
+    MATCH (dtc:DTC)-[:POINTS_TO]->(rc:RootCause)
+    WHERE rc.code IN $codes
+    RETURN rc.code AS cause_code, collect(dtc.code) AS dtc_codes
+    """
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, codes=cause_codes)
+            return {r["cause_code"]: r["dtc_codes"] for r in result}
+    except Exception:
+        return {}  # DTC nodes may not exist yet, fall back to property-based
+
+
+def query_located_in(cause_codes: list[str]) -> dict[str, list[dict]]:
+    """
+    查询根因关联的配置项：(RootCause)-[:LOCATED_IN]->(ConfigItem)。
+    返回 {cause_code: [{name, ci_no, module, supplier}, ...]} 映射。
+    """
+    if not cause_codes:
+        return {}
+
+    driver = get_neo4j_driver()
+    cypher = """
+    MATCH (rc:RootCause)-[:LOCATED_IN]->(ci:ConfigItem)
+    WHERE rc.code IN $codes
+    RETURN rc.code AS cause_code,
+           collect({name: ci.name, ci_no: ci.ci_no, module: ci.module, supplier: ci.supplier}) AS config_items
+    """
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, codes=cause_codes)
+            return {r["cause_code"]: r["config_items"] for r in result}
+    except Exception:
+        return {}
+
+
+def query_co_occurs_with(cause_codes: list[str]) -> dict[str, list[dict]]:
+    """
+    查询伴随根因：(RootCause)-[:CO_OCCURS_WITH]->(RootCause)。
+    返回 {cause_code: [{code, name, domain}, ...]} 映射。
+    """
+    if not cause_codes:
+        return {}
+
+    driver = get_neo4j_driver()
+    cypher = """
+    MATCH (rc:RootCause)-[:CO_OCCURS_WITH]->(related:RootCause)
+    WHERE rc.code IN $codes
+    RETURN rc.code AS cause_code,
+           collect({code: related.code, name: related.name, domain: related.domain}) AS related_causes
+    """
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, codes=cause_codes)
+            return {r["cause_code"]: r["related_causes"] for r in result}
+    except Exception:
+        return {}

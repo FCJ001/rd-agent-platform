@@ -10,6 +10,7 @@ class TriagePhase(str, Enum):
     QUERY = "QUERY"
     ASK = "ASK"
     CONCLUDE = "CONCLUDE"
+    END = "__end__"
 
 
 class CandidateCause(BaseModel):
@@ -26,6 +27,8 @@ class CandidateCause(BaseModel):
     verify_items: str = ""
     is_core_match: bool = False
     dtc_matched: list[str] = []
+    related_config_items: list[dict] = []
+    related_causes: list[str] = []
 
 
 class TriageState(BaseModel):

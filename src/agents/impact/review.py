@@ -79,7 +79,7 @@ async def _check_dependency(config_items: list[str]) -> dict:
 
 
 async def _check_baseline(config_items: list[str], target_baseline: str) -> dict:
-    """检查基线冲突：配置项是否与冻结基线冲突。"""
+    """检查基线冲突：三级匹配（exact → module → platform GraphRAG）。"""
     conflicts = []
     if not target_baseline or not config_items:
         return {"conflicts": [], "summary": "无基线冲突"}
@@ -88,36 +88,79 @@ async def _check_baseline(config_items: list[str], target_baseline: str) -> dict
         from src.infra.neo4j_client import get_neo4j_driver
         driver = get_neo4j_driver()
 
-        cypher = """
+        # Level 1: exact_match — 配置项精确命中已冻结基线
+        cypher_l1 = """
         MATCH (b:Baseline {name: $baseline})<-[:TARGETS]-(cr:ChangeRequest)-[:AFFECTED_BY]->(ci:ConfigItem)
-        WHERE ci.name IN $items
-        RETURN ci.name AS config_item, b.name AS baseline, b.is_frozen AS is_frozen
+        WHERE ci.name IN $items AND b.is_frozen = true
+        RETURN ci.name AS config_item, b.name AS baseline, 'exact_match' AS level
         """
         with driver.session() as session:
-            result = session.run(cypher, baseline=target_baseline, items=config_items)
+            result = session.run(cypher_l1, baseline=target_baseline, items=config_items)
             for r in result:
-                if r.get("is_frozen"):
+                conflicts.append({
+                    "config_item": r["config_item"],
+                    "baseline": r["baseline"],
+                    "level": r["level"],
+                })
+        exact_matched = {c["config_item"] for c in conflicts}
+
+        # Level 2: module_match — 同模块内其他配置项被冻结
+        remaining = [ci for ci in config_items if ci not in exact_matched]
+        if remaining:
+            cypher_l2 = """
+            MATCH (ci:ConfigItem)
+            WHERE ci.name IN $items
+            MATCH (b:Baseline {name: $baseline})<-[:TARGETS]-(cr:ChangeRequest)-[:AFFECTED_BY]->(frozen_ci:ConfigItem)
+            WHERE frozen_ci.module = ci.module AND frozen_ci.name <> ci.name AND b.is_frozen = true
+            RETURN ci.name AS config_item, frozen_ci.name AS frozen_item, b.name AS baseline, 'module_match' AS level
+            """
+            with driver.session() as session:
+                result = session.run(cypher_l2, baseline=target_baseline, items=remaining)
+                for r in result:
                     conflicts.append({
                         "config_item": r["config_item"],
                         "baseline": r["baseline"],
-                        "level": "exact_match",
+                        "frozen_item": r["frozen_item"],
+                        "level": r["level"],
                     })
+        module_matched = {c["config_item"] for c in conflicts}
+
+        # Level 3: platform_match — 同平台/代际产品线受影响（GraphRAG）
+        still_remaining = [ci for ci in config_items if ci not in module_matched]
+        if still_remaining:
+            try:
+                from src.agents.triage.graph_rag import search_graph_raw
+                llm = _get_llm()
+                query = (
+                    f"查找配置项 {', '.join(still_remaining)} 所在的平台/代际产品线，"
+                    f"以及基线 {target_baseline} 是否冻结了同平台的其他配置项"
+                )
+                records = await search_graph_raw(query, driver, llm)
+                if records:
+                    conflicts.append({
+                        "config_item": ", ".join(still_remaining),
+                        "baseline": target_baseline,
+                        "level": "platform_match",
+                        "evidence": str(records)[:200],
+                    })
+            except Exception as e:
+                logger = __import__("src.core.logger", fromlist=["logger"]).logger
+                logger.warning(f"[IMPACT] Level 3 platform_match 失败: {e}")
 
         return {
             "conflicts": conflicts,
-            "summary": f"发现 {len(conflicts)} 个冻结基线冲突" if conflicts else "无基线冲突",
+            "summary": f"发现 {len(conflicts)} 个冻结基线冲突（L1 exact: {len(exact_matched)}, L2 module: {len(module_matched) - len(exact_matched)}, L3 platform: {len(conflicts) - len(module_matched)}）" if conflicts else "无基线冲突",
         }
     except Exception as e:
         return {"conflicts": [], "summary": f"基线检查异常: {str(e)}"}
 
 
 async def _check_duplicate(config_items: list[str]) -> dict:
-    """检查是否有重复/冲突的变更请求。"""
+    """检查是否有重复/冲突的变更请求（按 config_items.category 聚合，避免同类不同名漏判）。"""
     if not config_items:
         return {"duplicates": [], "summary": "无重复变更"}
 
     try:
-        # Simplified: check via PostgreSQL alm_change_requests
         import psycopg2
         s = get_settings()
         conn = psycopg2.connect(
@@ -125,22 +168,51 @@ async def _check_duplicate(config_items: list[str]) -> dict:
             user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
         )
         cur = conn.cursor()
+
+        # 先查配置项的 category/module
         placeholders = ",".join(["%s"] * len(config_items))
         cur.execute(f"""
-            SELECT cr.cr_no, cr.title, cr.status
+            SELECT name, category, module FROM alm_config_items
+            WHERE name IN ({placeholders})
+        """, config_items)
+        ci_rows = {r[0]: {"category": r[1], "module": r[2]} for r in cur.fetchall()}
+
+        # 按 category 聚合：查找同 category 下的在途变更
+        categories = list({v["category"] for v in ci_rows.values() if v["category"]})
+        if not categories:
+            cur.close()
+            conn.close()
+            return {"duplicates": [], "summary": "无法确定配置项类别"}
+
+        cat_placeholders = ",".join(["%s"] * len(categories))
+        cur.execute(f"""
+            SELECT cr.cr_no, cr.title, cr.status, cr.scope_desc
             FROM alm_change_requests cr
             WHERE cr.status NOT IN ('closed', 'cancelled')
-              AND cr.scope_desc ILIKE ANY(ARRAY[%s])
-            LIMIT 5
-        """, (placeholders,))
-        # Note: simplified query — production would use proper config item matching
-        rows = [{"cr_no": r[0], "title": r[1], "status": r[2]} for r in cur.fetchall()]
+              AND cr.scope_desc IS NOT NULL
+            ORDER BY cr.created_at DESC
+            LIMIT 30
+        """)
+        all_open_crs = [
+            {"cr_no": r[0], "title": r[1], "status": r[2], "scope_desc": r[3] or ""}
+            for r in cur.fetchall()
+        ]
         cur.close()
         conn.close()
 
+        # Filter: 同 category 的配置项出现在 scope_desc 中
+        duplicates = []
+        for cr in all_open_crs:
+            for ci_name, ci_info in ci_rows.items():
+                cat = ci_info.get("category", "")
+                if cat and cat.lower() in cr["scope_desc"].lower():
+                    duplicates.append(cr)
+                    break  # 一个 CR 只记一次
+
         return {
-            "duplicates": rows,
-            "summary": f"发现 {len(rows)} 个可能冲突的在途变更" if rows else "无重复变更",
+            "duplicates": duplicates[:5],
+            "summary": f"发现 {len(duplicates)} 个同 category 在途变更" if duplicates
+            else f"按 {len(categories)} 个 category 未发现在途冲突",
         }
     except Exception as e:
         return {"duplicates": [], "summary": f"重复检查异常: {str(e)}"}

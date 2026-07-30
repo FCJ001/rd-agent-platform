@@ -2,17 +2,20 @@
 # Neo4j 图谱数据导入脚本
 # 将 alm_kg.json + alm_mirror.json 导入 Neo4j
 #
-# 节点类型（6 种）：
-#   OwnerDomain / RootCause / Phenomenon / ConfigItem / Baseline / Requirement
+# 节点类型（7 种）：
+#   OwnerDomain / RootCause / Phenomenon / DTC / ConfigItem / Baseline / Requirement
 #
-# 关系类型（7 种）：
-#   BELONGS_TO    RootCause → OwnerDomain
-#   INDICATES     RootCause → Phenomenon (weight, is_core)
-#   DEPENDS_ON    ConfigItem → ConfigItem
-#   ASSIGNED_TO   Requirement → Baseline
-#   AFFECTS       Requirement → ConfigItem
-#   TARGETS       ChangeRequest → Baseline
-#   TRIGGERED_BY  ChangeRequest → Issue
+# 关系类型（10 种）：
+#   BELONGS_TO      RootCause → OwnerDomain
+#   INDICATES       RootCause → Phenomenon (weight, is_core)
+#   POINTS_TO       DTC → RootCause
+#   LOCATED_IN      RootCause → ConfigItem
+#   CO_OCCURS_WITH  RootCause → RootCause
+#   DEPENDS_ON      ConfigItem → ConfigItem
+#   ASSIGNED_TO     Requirement → Baseline
+#   AFFECTS         Requirement → ConfigItem
+#   TARGETS         ChangeRequest → Baseline
+#   TRIGGERED_BY    ChangeRequest → Issue
 #
 # ★ 全部使用 MERGE，脚本天然幂等
 #
@@ -62,7 +65,7 @@ def import_kg(driver):
                 name=d["name"], line=d["business_line"], desc=d.get("description", ""),
             )
 
-        cause_count = phenom_count = cp_count = 0
+        cause_count = phenom_count = cp_count = dtc_count = dtc_rel_count = 0
         for c in causes:
             # RootCause 节点
             s.run(
@@ -76,6 +79,22 @@ def import_kg(driver):
                 dtc=c.get("dtc", []),
             )
             cause_count += 1
+
+            # DTC nodes + POINTS_TO relationship（从 rc.dtc 属性同步）
+            for dtc_code in c.get("dtc", []):
+                s.run(
+                    """MERGE (d:DTC {code: $code})
+                       SET d.system = $system, d.business_line = $line""",
+                    code=dtc_code, system="", line=c.get("business_line", "ev"),
+                )
+                s.run(
+                    """MATCH (d:DTC {code: $dtc_code})
+                       MATCH (rc:RootCause {code: $cause_code})
+                       MERGE (d)-[:POINTS_TO]->(rc)""",
+                    dtc_code=dtc_code, cause_code=c["code"],
+                )
+                dtc_count += 1
+                dtc_rel_count += 1
 
             # BELONGS_TO: RootCause → OwnerDomain
             if c.get("domain"):
@@ -104,7 +123,7 @@ def import_kg(driver):
                 phenom_count += 1
                 cp_count += 1
 
-    logger.info(f"Neo4j KG: {cause_count} RootCause / {phenom_count} Phenomenon / {cp_count} INDICATES")
+    logger.info(f"Neo4j KG: {cause_count} RootCause / {phenom_count} Phenomenon / {dtc_count} DTC / {cp_count} INDICATES / {dtc_rel_count} POINTS_TO")
 
 
 def import_mirror(driver):
@@ -244,6 +263,50 @@ def import_issues(driver):
     logger.info(f"Neo4j Issue: {len(rows)} 个节点")
 
 
+def import_graph_extras(driver):
+    """
+    补充 LOCATED_IN（RootCause → ConfigItem）和 CO_OCCURS_WITH（RootCause → RootCause）关系。
+
+    LOCATED_IN: 按 business_line 将根因关联到同线配置项（前 3 个）。
+    CO_OCCURS_WITH: 共享 ≥ 1 个现象的根因对，权重 = 共享现象数 / 总现象数。
+    """
+    located_count = 0
+    co_occur_count = 0
+
+    with driver.session() as s:
+        # ── LOCATED_IN: 同 business_line 的 RootCause ↔ ConfigItem ──
+        result = s.run("""
+            MATCH (rc:RootCause)
+            MATCH (ci:ConfigItem)
+            WHERE rc.business_line = ci.business_line
+            WITH rc, ci
+            ORDER BY rc.code, ci.ci_no
+            WITH rc, collect(ci)[0..3] AS top_cis
+            UNWIND top_cis AS ci
+            MERGE (rc)-[:LOCATED_IN]->(ci)
+            RETURN count(*) AS cnt
+        """)
+        located_count = result.single().get("cnt", 0)
+
+        # ── CO_OCCURS_WITH: 共享 ≥ 1 个现象的根因对 ──
+        result = s.run("""
+            MATCH (rc1:RootCause)-[:INDICATES]->(ph:Phenomenon)<-[:INDICATES]-(rc2:RootCause)
+            WHERE rc1.code < rc2.code
+            WITH rc1, rc2, count(ph) AS shared_phenomena
+            MATCH (rc1)-[:INDICATES]->(ph1:Phenomenon)
+            WITH rc1, rc2, shared_phenomena, count(ph1) AS total1
+            MATCH (rc2)-[:INDICATES]->(ph2:Phenomenon)
+            WITH rc1, rc2, shared_phenomena, total1, count(ph2) AS total2
+            WITH rc1, rc2, shared_phenomena,
+                 toFloat(shared_phenomena) / (total1 + total2 - shared_phenomena) AS weight
+            MERGE (rc1)-[:CO_OCCURS_WITH {weight: weight}]->(rc2)
+            RETURN count(*) AS cnt
+        """)
+        co_occur_count = result.single().get("cnt", 0)
+
+    logger.info(f"Neo4j Extras: {located_count} LOCATED_IN / {co_occur_count} CO_OCCURS_WITH")
+
+
 def main():
     settings = get_settings()
     # Neo4j 的 verify=True 需要 .local TLD hostname，本地测试关闭
@@ -267,8 +330,11 @@ def main():
     logger.info("2/3 导入 ALM 镜像...")
     import_mirror(driver)
 
-    logger.info("3/3 导入问题单...")
+    logger.info("3/4 导入问题单...")
     import_issues(driver)
+
+    logger.info("4/4 补充 LOCATED_IN / CO_OCCURS_WITH 关系...")
+    import_graph_extras(driver)
 
     driver.close()
     logger.info("Neo4j 导入完成")
