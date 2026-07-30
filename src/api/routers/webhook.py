@@ -20,9 +20,10 @@
 #   curl ... (同一条)
 # ============================================================
 
+import asyncio
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
@@ -167,8 +168,64 @@ async def consume_alm_event(
         f"→ {table}.{key_col} ({len(columns)} 字段)"
     )
 
+    # ---- ③ issue.created → 后台触发分诊 ----
+    if event.entity_type == "alm_issues" and event.event_type == "issue.created":
+        logger.info(f"[EVENT] 触发分诊 issue={event.entity_id}")
+        # 不阻塞 webhook 响应，fire-and-forget
+        try:
+            asyncio.create_task(_auto_triage_new_issue(event.entity_id, data))
+        except RuntimeError:
+            # 没有 event loop 时跳过（sync context）
+            logger.info(f"[EVENT] 无 event loop，跳过分诊触发")
+
     return ResponseSchema(
         code=200,
         message="created",
         data={"status": "processed", "event_id": event.entity_id},
     )
+
+
+async def _auto_triage_new_issue(issue_no: str, data: dict) -> None:
+    """
+    新问题单创建后自动执行分诊。
+    开发期直接在 webhook 里调用，生产环境可改为 Celery/MQ 异步任务。
+    """
+    import uuid
+
+    try:
+        from src.agents.triage.graph import run_triage, TriageDeps, _get_llm_json, _get_llm_chat
+        from src.infra.redis_cache import get_checkpointer_redis
+
+        llm_json = _get_llm_json()
+        llm_chat = _get_llm_chat()
+
+        async def _db_factory():
+            from src.infra.db import AsyncSessionLocal
+            async with AsyncSessionLocal() as session:
+                yield session
+
+        deps = TriageDeps(llm_json=llm_json, llm_chat=llm_chat, db_session_factory=_db_factory)
+
+        thread_id = f"auto:{issue_no}:{uuid.uuid4().hex[:6]}"
+        message = data.get("description", "") or data.get("title", "")
+        if data.get("dtc_snapshot"):
+            message += f"\nDTC: {data['dtc_snapshot']}"
+
+        logger.info(f"[AUTO-TRIAGE] 开始分诊 issue={issue_no} thread={thread_id}")
+        reply, new_state = await run_triage(
+            user_message=message,
+            thread_id=thread_id,
+            deps=deps,
+            existing_state=None,
+            viewer_role=data.get("source", "customer"),
+        )
+
+        logger.info(
+            f"[AUTO-TRIAGE] 分诊完成 issue={issue_no} "
+            f"phase={new_state.phase.value} "
+            f"candidates={len(new_state.candidate_causes)} "
+            f"confidence={new_state.confidence:.3f}"
+        )
+
+    except Exception as e:
+        logger.warning(f"[AUTO-TRIAGE] 分诊失败 issue={issue_no}: {e}")

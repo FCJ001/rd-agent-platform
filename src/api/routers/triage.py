@@ -130,6 +130,16 @@ async def submit_feedback(req: FeedbackRequest):
     logger.info(f"[TRIAGE-FB] session={req.session_id} adopted={req.adopted}")
 
     async with AsyncSessionLocal() as db:
+        # 先查当前记录拿到 confirmed_phenomena 和 primary_cause_code
+        select_result = await db.execute(
+            sa_text(
+                "SELECT confirmed_phenomena, primary_cause_code "
+                "FROM ai_triage_results WHERE session_id = :session_id"
+            ),
+            {"session_id": req.session_id},
+        )
+        row = select_result.fetchone()
+
         result = await db.execute(
             sa_text(
                 "UPDATE ai_triage_results SET adopted = :adopted, feedback_comment = :comment, "
@@ -143,5 +153,32 @@ async def submit_feedback(req: FeedbackRequest):
         )
         await db.commit()
         updated = result.rowcount > 0
+
+    # ── 触发诊断结论回流图谱 ──
+    if updated and req.adopted and row:
+        try:
+            confirmed = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
+            cause_code = row[1]
+            from src.agents.triage.feedback_loop import reinforce_graph_on_adopted
+            await reinforce_graph_on_adopted(
+                confirmed_phenomena=confirmed,
+                primary_cause_code=cause_code,
+                session_id=req.session_id,
+            )
+            logger.info(f"[TRIAGE-FB] 图谱增强已触发 session={req.session_id}")
+        except Exception as e:
+            logger.warning(f"[TRIAGE-FB] 图谱增强失败: {e}")
+    elif updated and not req.adopted and row:
+        try:
+            confirmed = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
+            cause_code = row[1]
+            from src.agents.triage.feedback_loop import weaken_graph_on_rejected
+            await weaken_graph_on_rejected(
+                confirmed_phenomena=confirmed,
+                primary_cause_code=cause_code,
+            )
+            logger.info(f"[TRIAGE-FB] 图谱弱化已触发 session={req.session_id}")
+        except Exception as e:
+            logger.warning(f"[TRIAGE-FB] 图谱弱化失败: {e}")
 
     return ResponseSchema(data=FeedbackResult(session_id=req.session_id, updated=updated))

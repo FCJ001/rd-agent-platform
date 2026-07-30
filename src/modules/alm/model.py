@@ -309,6 +309,8 @@ class AiImpactAnalysis(BaseModel):
     duplicate_result: Mapped[str | None] = mapped_column(Text, comment="重复变更 JSON")
     risk_level: Mapped[str] = mapped_column(String(20), default="medium", comment="风险等级：low/medium/high/critical")
     report_md: Mapped[str | None] = mapped_column(Text, comment="Markdown 分析报告")
+    adopted: Mapped[bool | None] = mapped_column(Boolean, comment="人工是否采纳（None=未反馈）")
+    feedback_comment: Mapped[str | None] = mapped_column(Text, comment="人工反馈备注")
 
     __table_args__ = (
         Index("ix_impact_cr", "change_request_id"),
@@ -322,6 +324,7 @@ class AiReportInterpretation(BaseModel):
     __tablename__ = "ai_report_interpretations"
 
     source_issue_id: Mapped[int | None] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), comment="来源问题单 ID")
+    session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID")
     report_type: Mapped[str] = mapped_column(String(30), nullable=False, comment="报告类型：DTC扫描/台架测试/OTA回归")
     minio_key: Mapped[str | None] = mapped_column(String(200), comment="MinIO 附件路径")
     raw_text: Mapped[str | None] = mapped_column(Text, comment="原始报告文本")
@@ -329,10 +332,13 @@ class AiReportInterpretation(BaseModel):
     abnormal_count: Mapped[int] = mapped_column(Integer, default=0, comment="异常指标数")
     interpretation: Mapped[str | None] = mapped_column(Text, comment="LLM 生成的结构化解读")
     reviewed: Mapped[bool | None] = mapped_column(Boolean, comment="人工复核结果")
+    adopted: Mapped[bool | None] = mapped_column(Boolean, comment="人工是否采纳（None=未反馈）")
+    feedback_comment: Mapped[str | None] = mapped_column(Text, comment="人工反馈备注")
 
     __table_args__ = (
         Index("ix_report_issue", "source_issue_id"),
         Index("ix_report_type", "report_type"),
+        Index("ix_report_session", "session_id"),
     )
 
 

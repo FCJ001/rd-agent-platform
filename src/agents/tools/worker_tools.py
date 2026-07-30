@@ -62,6 +62,34 @@ async def call_impact_agent(message: str, runtime: ToolRuntime[UserContext]) -> 
     from src.agents.workers.impact_agent import get_impact_agent
     agent = get_impact_agent()
     report = await agent.analyze(message)
+
+    # 保存到影子表，供反馈回写
+    risk = "medium"
+    if "critical" in report.lower() or "严重" in report:
+        risk = "critical"
+    elif "high" in report.lower() or "高风险" in report:
+        risk = "high"
+    elif "low" in report.lower() or "低风险" in report:
+        risk = "low"
+
+    try:
+        from sqlalchemy import text
+        from src.infra.db import AsyncSessionLocal
+        session_id = runtime.context.session_id if runtime else "unknown"
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO ai_impact_analysis (session_id, raw_input, report_md, risk_level) "
+                    "VALUES (:sid, :input, :report, :risk)"
+                ),
+                {"sid": session_id, "input": message, "report": report, "risk": risk},
+            )
+            await db.commit()
+    except Exception:
+        import traceback
+        from src.core.logger import logger
+        logger.warning(f"[IMPACT] 保存分析结果失败: {traceback.format_exc()}")
+
     return report
 
 
@@ -76,7 +104,29 @@ async def call_report_agent(message: str, report_type: str = "DTC扫描", runtim
     """
     from src.agents.workers.report_agent import get_report_agent
     agent = get_report_agent()
-    return await agent.analyze(message, report_type)
+    result = await agent.analyze(message, report_type)
+
+    # 保存到影子表，供反馈回写
+    try:
+        from sqlalchemy import text
+        from src.infra.db import AsyncSessionLocal
+        session_id = runtime.context.session_id if runtime else "unknown"
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text(
+                    "INSERT INTO ai_report_interpretations "
+                    "(session_id, report_type, raw_text, interpretation) "
+                    "VALUES (:sid, :rtype, :raw, :interp)"
+                ),
+                {"sid": session_id, "rtype": report_type, "raw": message, "interp": result},
+            )
+            await db.commit()
+    except Exception:
+        import traceback
+        from src.core.logger import logger
+        logger.warning(f"[REPORT] 保存解读结果失败: {traceback.format_exc()}")
+
+    return result
 
 
 @tool
@@ -122,5 +172,6 @@ async def call_dedup_check(message: str, runtime: ToolRuntime[UserContext] = Non
 
 
 from src.agents.tools.remote_knowledge import REMOTE_TOOLS
+from src.agents.tools.platform_tools import PLATFORM_TOOLS
 
-WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent, call_dedup_check] + REMOTE_TOOLS
+WORKER_TOOLS = [call_triage_agent, call_impact_agent, call_report_agent, call_dedup_check] + REMOTE_TOOLS + PLATFORM_TOOLS

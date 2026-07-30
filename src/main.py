@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from src.api.routers import chat, issues, triage, webhook
+from src.api.routers import chat, feedback, issues, triage, webhook
 from src.core.base_schema import ResponseSchema
 from src.core.config import get_settings
 from src.core.exceptions import register_exception_handlers
@@ -39,6 +39,7 @@ register_exception_handlers(app)
 app.include_router(chat.router)
 app.include_router(issues.router)
 app.include_router(triage.router)
+app.include_router(feedback.router)
 app.include_router(webhook.router)
 
 

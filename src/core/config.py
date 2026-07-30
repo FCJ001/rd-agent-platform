@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # ---------------- 项目二（知识服务，步 7 才用到）----------------
     KNOWLEDGE_SVC_URL: str = "http://localhost:8001"
 
+    # ---------------- Java ALM 平台（开发期 logger 占位）----------------
+    PLATFORM_ALM_URL: str = "https://alm.internal"
+    PLATFORM_ALM_API_URL: str = "https://alm.internal/api"
+
     # ---------------- 日志 ----------------
     LOG_LEVEL: str = "DEBUG"
     LOG_DIR: str = "logs"

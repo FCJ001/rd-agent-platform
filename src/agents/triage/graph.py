@@ -315,6 +315,17 @@ async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
     response = await deps.llm_chat.ainvoke([SystemMessage(content=prompt)])
     summary = response.content
 
+    # 追加操作选项（Agent 主动询问用户下一步）
+    if confidence >= 0.5:
+        summary += (
+            "\n\n---\n"
+            "### 接下来需要我做什么？\n"
+            "- 回复 **创建** — 在 ALM 平台正式记录此问题，分配工程师跟进\n"
+            "- 回复 **跳转** — 前往 ALM 平台查看相关历史问题单\n"
+            "- 回复 **结案** — 如果已确认根因和修复方案，提交结案建议\n"
+            '\n直接回复「创建」、「跳转」或「结案」，或者描述具体需求即可。'
+        )
+
     # Save to DB
     async for db in deps.db_session_factory():
         try:
