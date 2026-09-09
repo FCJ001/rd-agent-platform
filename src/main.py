@@ -7,7 +7,11 @@
 
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from src.api.routers import chat, feedback, issues, triage, webhook
 from src.core.base_schema import ResponseSchema
@@ -33,6 +37,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_middleware(TraceLoggingMiddleware)
 register_exception_handlers(app)
 
@@ -41,6 +52,13 @@ app.include_router(issues.router)
 app.include_router(triage.router)
 app.include_router(feedback.router)
 app.include_router(webhook.router)
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/health", response_model=ResponseSchema[dict])

@@ -1,4 +1,4 @@
-"""跨服务工具：调项目二 rd-knowledge-svc 的知识库和 BI 查询。"""
+"""跨服务工具：调 rd-knowledge-svc 的知识库，调 rd-chatBI 的 BI 查询。"""
 
 import json
 
@@ -13,9 +13,10 @@ from src.core.logger import logger
 settings = get_settings()
 
 
-def _auth_headers(ctx: UserContext) -> dict:
-    """项目二的身份走 HTTP Header，不放在 Body 里。
+def _auth_headers(ctx: UserContext, project_id: str | None = None) -> dict:
+    """下游服务身份走 HTTP Header，不放在 Body 里。
     可选 header 只在有值时发送，避免空字符串被 FastAPI 校验拒绝（422）。
+    project_id: ChatBI 多数据源路由（bi_datasources.code），如 rd_agent。
     """
     headers = {
         "X-User-Id": ctx.user_id,
@@ -23,6 +24,8 @@ def _auth_headers(ctx: UserContext) -> dict:
         "X-User-Role": ctx.role,
         "Content-Type": "application/json",
     }
+    if project_id:
+        headers["X-Project-Id"] = project_id
     if ctx.business_line:
         headers["X-Business-Line"] = ctx.business_line
     if ctx.owner_domain_id:
@@ -47,6 +50,28 @@ async def _post(endpoint: str, body: dict, ctx: UserContext, timeout: int = 30) 
     except Exception as e:
         logger.warning(f"[REMOTE] 请求失败: {url} err={e}")
         return {"error": f"知识库服务异常: {str(e)}"}
+
+
+async def _post_bi(endpoint: str, body: dict, ctx: UserContext, timeout: int = 60) -> dict:
+    """ChatBI 服务专用 POST：指向 rd-chatBI + X-Project-Id 数据源路由。"""
+    url = f"{settings.BI_SVC_URL}{endpoint}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                url, json=body,
+                headers=_auth_headers(ctx, project_id=settings.BI_PROJECT_ID),
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.ConnectError:
+        logger.warning(f"[REMOTE] 无法连接 ChatBI 服务: {url}")
+        return {"error": "BI 服务暂不可用，请稍后重试"}
+    except httpx.TimeoutException:
+        logger.warning(f"[REMOTE] ChatBI 请求超时: {url}")
+        return {"error": "BI 服务响应超时，请稍后重试"}
+    except Exception as e:
+        logger.warning(f"[REMOTE] ChatBI 请求失败: {url} err={e}")
+        return {"error": f"BI 服务异常: {str(e)}"}
 
 
 def _unwrap(data: dict) -> dict:
@@ -101,33 +126,34 @@ async def call_operation_agent(message: str, runtime: ToolRuntime[UserContext]) 
     body = {
         "question": message,
         "session_id": f"{ctx.user_id}:{ctx.session_id}",
-        "with_chart": True,
+        # 只取 SQL 查出的数据/摘要；图表由 BI 前端页直连 rd-chatBI 渲染
+        "with_chart": False,
     }
 
-    resp = await _post("/api/v1/bi/query", body, ctx, timeout=60)
+    resp = await _post_bi("/api/v1/bi/query", body, ctx)
     if "error" in resp:
         return resp["error"]
 
-    data = _unwrap(resp)
+    data = resp.get("data") or {}
     summary = data.get("summary", "")
     success = data.get("success", False)
     sql = data.get("sql", "")
     rows = data.get("data", [])
     row_count = data.get("row_count", 0)
-    has_chart = data.get("chart") is not None
+
+    if not success:
+        return f"查询失败：{data.get('error') or summary[:200]}"
 
     lines = [summary]
 
-    if not success:
-        return f"查询失败：{summary[:200]}"
-
-    if row_count <= 10 and rows:
-        lines.append("\n**数据明细：**")
-        for row in rows:
-            lines.append(f"- {json.dumps(row, ensure_ascii=False)}")
-
-    if has_chart:
-        lines.append(f"\n*图表数据已生成*")
+    if rows:
+        lines.append(f"\n**数据明细（共 {row_count} 行，最多展示 20 行）：**")
+        for row in rows[:20]:
+            lines.append(f"- {json.dumps(row, ensure_ascii=False, default=str)}")
+        if row_count > 20:
+            lines.append(f"- …其余 {row_count - 20} 行略")
+    if sql:
+        lines.append(f"\n*查询 SQL：{sql}*")
 
     return "\n".join(lines)
 

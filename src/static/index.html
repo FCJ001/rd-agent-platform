@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RD Agent Platform — 研发过程智能助手</title>
+<style>
+/* ══════════════════════════════════════════════════════════════
+   Design Tokens — 深岩蓝主色 + 比亚迪红点缀
+   ══════════════════════════════════════════════════════════════ */
+:root {
+  --primary: #1E6FFF;
+  --primary-hover: #1556CC;
+  --primary-light: #EBF3FF;
+  --danger: #E32219;
+  --danger-light: #FEF2F2;
+  --warning: #F59E0B;
+  --warning-light: #FFFBEB;
+  --success: #10B981;
+  --success-light: #ECFDF5;
+
+  --title: #111827;
+  --body: #374151;
+  --muted: #6B7280;
+  --border: #E5E7EB;
+  --bg: #F9FAFB;
+  --card: #FFFFFF;
+  --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+  --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+/* ── Dark Mode ── */
+[data-theme="dark"] {
+  --primary: #3B8CFF;
+  --primary-hover: #5CA0FF;
+  --primary-light: #1E3050;
+  --title: #F9FAFB;
+  --body: #D1D5DB;
+  --muted: #9CA3AF;
+  --border: #374151;
+  --bg: #0F172A;
+  --card: #1E293B;
+  --shadow: 0 1px 3px rgba(0,0,0,.3);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Reset & Base
+   ══════════════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+html, body { height:100%; overflow:hidden; }
+body {
+  font-family: var(--font);
+  font-size: 14px; color: var(--body); background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Shell — Three-Column
+   ══════════════════════════════════════════════════════════════ */
+.shell { display:flex; height:100vh; }
+
+/* ── Top Bar ── */
+.topbar {
+  position:fixed; top:0; left:0; right:0; z-index:100;
+  height:52px; background:var(--card); border-bottom:1px solid var(--border);
+  display:flex; align-items:center; padding:0 20px; gap:16px;
+}
+.topbar .logo { font-size:16px; font-weight:700; color:var(--title); white-space:nowrap; }
+.topbar .logo span { font-weight:400; color:var(--muted); }
+.topbar .dot { width:8px; height:8px; border-radius:50%; background:var(--success); flex-shrink:0; }
+.topbar .spacer { flex:1; }
+.topbar .badge { font-size:12px; padding:3px 10px; border-radius:12px; background:var(--primary-light); color:var(--primary); font-weight:500; }
+.topbar .icon-btn { width:34px; height:34px; border:none; border-radius:var(--radius-sm); background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:18px; }
+.topbar .icon-btn:hover { background:var(--bg); color:var(--title); }
+.topbar select { font-size:13px; padding:4px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--card); color:var(--body); cursor:pointer; }
+
+/* ── Sidebar ── */
+.sidebar {
+  width:280px; min-width:280px; background:var(--card); border-right:1px solid var(--border);
+  display:flex; flex-direction:column; margin-top:52px; height:calc(100vh - 52px);
+}
+.sidebar .search-wrap { padding:14px; }
+.sidebar .search-wrap input {
+  width:100%; padding:8px 12px; border:1px solid var(--border); border-radius:var(--radius-sm);
+  background:var(--bg); font-size:13px; outline:none; color:var(--title);
+}
+.sidebar .search-wrap input:focus { border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-light); }
+.sidebar .new-btn {
+  margin:0 14px 12px; padding:9px; border:1px dashed var(--border); border-radius:var(--radius-sm);
+  background:transparent; cursor:pointer; font-size:13px; color:var(--primary); font-weight:500;
+  display:flex; align-items:center; justify-content:center; gap:6px; transition:all .15s;
+}
+.sidebar .new-btn:hover { border-color:var(--primary); background:var(--primary-light); }
+.sidebar .sessions { flex:1; overflow-y:auto; padding:0 8px 12px; }
+.sidebar .group-label { font-size:11px; font-weight:600; color:var(--muted); padding:10px 8px 4px; text-transform:uppercase; letter-spacing:.04em; }
+.sidebar .session-item {
+  padding:10px 12px; border-radius:var(--radius-sm); cursor:pointer; margin-bottom:2px;
+  display:flex; align-items:flex-start; gap:10px; transition:background .1s;
+}
+.sidebar .session-item:hover { background:var(--bg); }
+.sidebar .session-item.active { background:var(--primary-light); }
+.sidebar .session-item .si-dot { width:8px; height:8px; border-radius:50%; margin-top:5px; flex-shrink:0; }
+.sidebar .session-item .si-dot.open { background:var(--danger); }
+.sidebar .session-item .si-dot.progress { background:var(--warning); }
+.sidebar .session-item .si-dot.done { background:var(--success); }
+.sidebar .session-item .si-info { flex:1; min-width:0; }
+.sidebar .session-item .si-title { font-size:13px; font-weight:500; color:var(--title); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sidebar .session-item .si-meta { font-size:11px; color:var(--muted); margin-top:2px; }
+.sidebar .session-item.active .si-title { color:var(--primary); }
+
+/* ── Main Chat ── */
+.main {
+  flex:1; display:flex; flex-direction:column; margin-top:52px; height:calc(100vh - 52px);
+  min-width:0; background:var(--bg);
+}
+.chat-area { flex:1; overflow-y:auto; padding:20px 24px; }
+.chat-area .inner { max-width:780px; margin:0 auto; }
+.input-bar {
+  border-top:1px solid var(--border); background:var(--card);
+  padding:14px 24px; display:flex; align-items:flex-end; gap:10px;
+}
+.input-bar textarea {
+  flex:1; resize:none; border:1px solid var(--border); border-radius:var(--radius);
+  padding:10px 14px; font-size:14px; font-family:var(--font); outline:none; min-height:44px; max-height:140px;
+  background:var(--bg); color:var(--title);
+}
+.input-bar textarea:focus { border-color:var(--primary); box-shadow:0 0 0 3px var(--primary-light); }
+.input-bar .send-btn {
+  width:44px; height:44px; border:none; border-radius:50%; background:var(--primary);
+  color:#fff; cursor:pointer; font-size:20px; display:flex; align-items:center; justify-content:center;
+  flex-shrink:0; transition:background .15s;
+}
+.input-bar .send-btn:hover { background:var(--primary-hover); }
+.input-bar .send-btn:disabled { background:var(--border); cursor:not-allowed; }
+
+/* ── Context Panel ── */
+.context {
+  width:320px; min-width:320px; background:var(--card); border-left:1px solid var(--border);
+  margin-top:52px; height:calc(100vh - 52px); overflow-y:auto; padding:16px;
+}
+.context .cp-title { font-size:14px; font-weight:600; color:var(--title); margin-bottom:14px; }
+.context .cp-card {
+  background:var(--bg); border-radius:var(--radius-sm); padding:12px; margin-bottom:10px;
+}
+.context .cp-card .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px; }
+.context .cp-card .value { font-size:14px; color:var(--title); font-weight:500; }
+.context .phase-tag {
+  display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:500;
+}
+.phase-tag.extract { background:var(--primary-light); color:var(--primary); }
+.phase-tag.query { background:var(--warning-light); color:var(--warning); }
+.phase-tag.conclude { background:var(--success-light); color:var(--success); }
+.bar-wrap { height:8px; background:var(--border); border-radius:4px; overflow:hidden; margin-top:6px; }
+.bar-wrap .bar-fill { height:100%; border-radius:4px; background:var(--primary); transition:width .4s ease; }
+.bar-fill.high { background:var(--success); }
+.bar-fill.mid { background:var(--warning); }
+.bar-fill.low { background:var(--danger); }
+
+.cause-list { list-style:none; }
+.cause-list li {
+  padding:8px 0; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px;
+}
+.cause-list li:last-child { border-bottom:none; }
+.cause-list .rank { width:22px; height:22px; border-radius:50%; background:var(--primary-light); color:var(--primary); font-size:11px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+.cause-list .cn { font-size:13px; color:var(--title); flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cause-list .cc { font-size:12px; color:var(--muted); flex-shrink:0; }
+
+.phenom-tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; margin:2px 3px; }
+.phenom-tag.confirmed { background:var(--success-light); color:var(--success); }
+.phenom-tag.denied { background:var(--danger-light); color:var(--danger); }
+
+/* ══════════════════════════════════════════════════════════════
+   Messages — Chat Bubbles & Cards
+   ══════════════════════════════════════════════════════════════ */
+.msg { margin-bottom:20px; animation:fadeUp .25s ease; }
+@keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.msg.user { display:flex; justify-content:flex-end; }
+.msg.user .bubble { background:var(--primary); color:#fff; max-width:75%; padding:10px 16px; border-radius:18px 18px 4px 18px; line-height:1.6; font-size:14px; }
+.msg.assistant .bubble { max-width:100%; }
+
+.msg .meta { font-size:11px; color:var(--muted); margin-bottom:4px; display:flex; align-items:center; gap:6px; }
+
+/* Diagnostic Card */
+.diag-card {
+  background:var(--card); border:1px solid var(--border); border-left:4px solid var(--primary);
+  border-radius:var(--radius); padding:18px 20px; margin:10px 0;
+}
+.diag-card h3 { font-size:15px; font-weight:600; color:var(--title); margin-bottom:10px; }
+.diag-card .dc-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+.diag-card .dc-label { font-size:12px; color:var(--muted); }
+.diag-card .dc-val { font-size:13px; color:var(--body); font-weight:500; }
+
+/* Action Buttons */
+.action-row { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; }
+.action-btn {
+  display:inline-flex; align-items:center; gap:6px; padding:8px 16px;
+  border-radius:var(--radius-sm); font-size:13px; font-weight:500; cursor:pointer; border:none;
+  transition:all .15s;
+}
+.action-btn.primary { background:var(--primary); color:#fff; }
+.action-btn.primary:hover { background:var(--primary-hover); }
+.action-btn.secondary { background:var(--card); color:var(--body); border:1px solid var(--border); }
+.action-btn.secondary:hover { background:var(--bg); }
+
+/* Safety Alert */
+.safety-alert {
+  border:2px solid var(--danger); border-radius:var(--radius); padding:14px 16px;
+  background:var(--danger-light); margin:10px 0;
+}
+.safety-alert h4 { color:var(--danger); font-size:14px; margin-bottom:6px; }
+
+/* Welcome */
+.welcome { text-align:center; padding:40px 20px 0; }
+.welcome h2 { font-size:22px; color:var(--title); margin-bottom:6px; }
+.welcome .subtitle { color:var(--muted); margin-bottom:32px; }
+.capability-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; max-width:700px; margin:0 auto; }
+.cap-card {
+  background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+  padding:18px 16px; text-align:left; cursor:pointer; transition:all .15s;
+}
+.cap-card:hover { border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-light); }
+.cap-card .cap-icon { font-size:22px; margin-bottom:8px; }
+.cap-card .cap-title { font-size:14px; font-weight:600; color:var(--title); margin-bottom:4px; }
+.cap-card .cap-desc { font-size:12px; color:var(--muted); line-height:1.5; }
+
+/* Markdown content styling */
+.bubble h1,.bubble h2,.bubble h3 { font-size:15px; color:var(--title); margin:10px 0 6px; }
+.bubble p { margin:4px 0; line-height:1.7; }
+.bubble ul,.bubble ol { margin:6px 0; padding-left:18px; }
+.bubble li { margin:3px 0; }
+.bubble strong { color:var(--title); }
+.bubble code { font-family:var(--mono); font-size:12px; background:var(--bg); padding:1px 5px; border-radius:3px; }
+.bubble pre { background:var(--bg); padding:10px; border-radius:var(--radius-sm); overflow-x:auto; font-size:12px; }
+.bubble table { border-collapse:collapse; margin:8px 0; width:100%; }
+.bubble th,.bubble td { border:1px solid var(--border); padding:6px 10px; font-size:13px; text-align:left; }
+.bubble th { background:var(--bg); font-weight:600; }
+
+/* Typing indicator */
+.typing { display:inline-flex; gap:4px; padding:8px 0; }
+.typing span { width:6px; height:6px; border-radius:50%; background:var(--muted); animation:bounce 1.4s infinite both; }
+.typing span:nth-child(2) { animation-delay:.2s; }
+.typing span:nth-child(3) { animation-delay:.4s; }
+@keyframes bounce { 0%,80%,100% { transform:scale(0); } 40% { transform:scale(1); } }
+
+/* Scrollbar */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* Responsive */
+@media (max-width:1100px) { .context { display:none; } }
+@media (max-width:700px)  { .sidebar { display:none; } }
+</style>
+</head>
+<body>
+
+<div class="shell">
+  <!-- ═══ Top Bar ═══ -->
+  <div class="topbar">
+    <div class="logo">🔷 RD Agent <span>· 研发过程智能助手</span></div>
+    <div class="dot" id="statusDot" title="服务状态"></div>
+    <span style="font-size:12px;color:var(--muted)" id="statusText">检测中…</span>
+    <div class="spacer"></div>
+    <button class="icon-btn" onclick="toggleTheme()" title="切换主题">🌓</button>
+    <select id="roleSelect" onchange="onRoleChange()">
+      <option value="engineer">🔧 工程师</option>
+      <option value="business">📊 业务</option>
+      <option value="aftersales">🔧 售后</option>
+      <option value="customer">👤 客户</option>
+    </select>
+    <button class="icon-btn" onclick="newSession()" title="新建会话">＋</button>
+  </div>
+
+  <!-- ═══ Left: Session List ═══ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="search-wrap">
+      <input type="text" id="sessionSearch" placeholder="🔍 搜索会话…" oninput="renderSessionList()">
+    </div>
+    <button class="new-btn" onclick="newSession()">＋ 新建诊断</button>
+    <div class="sessions" id="sessionList"></div>
+  </aside>
+
+  <!-- ═══ Center: Chat ═══ -->
+  <main class="main">
+    <div class="chat-area" id="chatArea">
+      <div class="inner" id="chatInner">
+        <div class="welcome" id="welcomeScreen">
+          <h2>研发过程智能助手</h2>
+          <p class="subtitle">AI 驱动的故障诊断、变更影响分析、报告解读</p>
+          <div class="capability-grid">
+            <div class="cap-card" onclick="quickStart('车机中控屏黑屏，DTC码U0100，高速上出现过两次')">
+              <div class="cap-icon">🔬</div>
+              <div class="cap-title">故障诊断</div>
+              <div class="cap-desc">描述车辆故障现象，AI 分诊定位根因</div>
+            </div>
+            <div class="cap-card" onclick="quickStart('分析变更影响：升级网关MCU固件到v3.2.1，目标基线2025Q3')">
+              <div class="cap-icon">📊</div>
+              <div class="cap-title">变更影响分析</div>
+              <div class="cap-desc">评估 CR 影响范围，检查基线/依赖冲突</div>
+            </div>
+            <div class="cap-card" onclick="quickStart('解读台架测试报告：电池SOH 72%，单体压差 85mV，HMI冷启动 9200ms')">
+              <div class="cap-icon">📋</div>
+              <div class="cap-title">报告解读</div>
+              <div class="cap-desc">解读测试报告，自动判定异常指标</div>
+            </div>
+            <div class="cap-card" onclick="quickStart('电池健康度SOH低于多少需要更换？')">
+              <div class="cap-icon">📚</div>
+              <div class="cap-title">知识库搜索</div>
+              <div class="cap-desc">搜索技术规范、标准、设计文档</div>
+            </div>
+            <div class="cap-card" onclick="quickStart('最近一个月各域的缺陷密度对比')">
+              <div class="cap-icon">📈</div>
+              <div class="cap-title">运营 BI 查询</div>
+              <div class="cap-desc">查询质量趋势、缺陷密度、分布</div>
+            </div>
+            <div class="cap-card" onclick="quickStart('车机中控屏黑屏，系统响应慢，DTC码U0100')">
+              <div class="cap-icon">🔍</div>
+              <div class="cap-title">问题去重检测</div>
+              <div class="cap-desc">检查是否有相似问题单，避免重复建单</div>
+            </div>
+          </div>
+        </div>
+        <div id="messages"></div>
+      </div>
+    </div>
+    <div class="input-bar">
+      <textarea id="userInput" rows="1" placeholder="输入故障现象、变更描述、报告内容…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="send()">➤</button>
+    </div>
+  </main>
+
+  <!-- ═══ Right: Context Panel ═══ -->
+  <aside class="context" id="contextPanel">
+    <div id="contextContent">
+      <div class="cp-title">📊 诊断上下文</div>
+      <div class="cp-card" style="text-align:center;padding:40px 12px;">
+        <div style="font-size:36px;margin-bottom:8px;">🔬</div>
+        <div style="color:var(--muted);font-size:13px;">开始诊断后将在此展示<br>置信度、候选根因等信息</div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   State
+   ══════════════════════════════════════════════════════════════ */
+const BASE = 'http://localhost:8000';
+const store = {
+  sessions: JSON.parse(localStorage.getItem('rd_sessions')||'[]'),
+  activeSid: localStorage.getItem('rd_active_sid')||'',
+  role: localStorage.getItem('rd_role')||'engineer',
+  theme: localStorage.getItem('rd_theme')||'light',
+  history: null, // current chat messages [{role,content}]
+  triageState: null, // context from last assistant reply
+};
+
+/* ══════════════════════════════════════════════════════════════
+   Init
+   ══════════════════════════════════════════════════════════════ */
+function init() {
+  document.getElementById('roleSelect').value = store.role;
+  if (store.theme === 'dark') document.documentElement.setAttribute('data-theme','dark');
+  checkHealth();
+  restoreOrWelcome();
+  renderSessionList();
+}
+function checkHealth() {
+  fetch(BASE+'/health').then(r=>r.json()).then(d=>{
+    document.getElementById('statusDot').style.background='var(--success)';
+    document.getElementById('statusText').textContent='在线';
+  }).catch(()=>{
+    document.getElementById('statusDot').style.background='var(--danger)';
+    document.getElementById('statusText').textContent='离线';
+  });
+}
+
+function restoreOrWelcome() {
+  if (store.activeSid && store.sessions.length) {
+    const s = store.sessions.find(x=>x.id===store.activeSid);
+    if (s) { store.history = s.messages||[]; render(); return; }
+  }
+  store.activeSid = ''; store.history = null;
+  render();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Session Management
+   ══════════════════════════════════════════════════════════════ */
+function newSession() {
+  const sid = 's_' + Math.random().toString(36).slice(2,8);
+  const now = new Date();
+  store.sessions.unshift({ id:sid, title:'新诊断', createdAt:now.toISOString(), messages:[], phase:null });
+  store.activeSid = sid;
+  store.history = [];
+  store.triageState = null;
+  persist();
+  render();
+  document.getElementById('userInput').focus();
+}
+
+function switchSession(sid) {
+  store.activeSid = sid;
+  const s = store.sessions.find(x=>x.id===sid);
+  store.history = s ? (s.messages||[]) : [];
+  store.triageState = null;
+  persist();
+  render();
+}
+
+function deleteSession(sid) {
+  store.sessions = store.sessions.filter(x=>x.id!==sid);
+  if (store.activeSid === sid) { store.activeSid=''; store.history=null; store.triageState=null; }
+  persist();
+  render();
+}
+
+function persist() {
+  if (store.activeSid && store.history) {
+    const s = store.sessions.find(x=>x.id===store.activeSid);
+    if (s) { s.messages = store.history; s.updatedAt = new Date().toISOString(); }
+  }
+  localStorage.setItem('rd_sessions', JSON.stringify(store.sessions));
+  localStorage.setItem('rd_active_sid', store.activeSid);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Chat API — SSE Streaming
+   ══════════════════════════════════════════════════════════════ */
+async function send(msg) {
+  const input = document.getElementById('userInput');
+  const text = msg || input.value.trim();
+  if (!text) return;
+  if (!store.activeSid) newSession();
+  input.value = '';
+
+  // Hide welcome
+  const welcome = document.getElementById('welcomeScreen');
+  if (welcome) welcome.style.display = 'none';
+
+  // Append user message
+  if (!store.history) store.history = [];
+  store.history.push({role:'user',content:text});
+  appendMessage('user', text);
+  scrollDown();
+  setSending(true);
+
+  // Update session title
+  const s = store.sessions.find(x=>x.id===store.activeSid);
+  if (s && s.title==='新诊断') s.title = text.slice(0,30)+(text.length>30?'…':'');
+
+  // Streaming
+  const placeholder = appendMessage('assistant', '<div class="typing"><span></span><span></span><span></span></div>', true);
+  let full = '';
+  try {
+    const resp = await fetch(BASE+'/api/v1/chat/stream', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({user_id:'web',session_id:store.activeSid,message:text,role:store.role})
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const {done,value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value,{stream:true});
+      const lines = buf.split('\n\n');
+      buf = lines.pop();
+      for (const l of lines) {
+        const line = l.trim();
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const d = JSON.parse(line.slice(6));
+          if (d.type==='token') { full+=d.content; updateBubble(placeholder, full); scrollDown(); }
+          else if (d.type==='done') { full = d.content||full; updateBubble(placeholder, full); }
+          else if (d.type==='error') { full='⚠️ '+d.message; updateBubble(placeholder, full); }
+        } catch(e){}
+      }
+    }
+  } catch(e) {
+    full = '⚠️ 请求失败: ' + e.message;
+    updateBubble(placeholder, full);
+  }
+
+  store.history.push({role:'assistant',content:full});
+  updateBubble(placeholder, full);
+  updateContextPanel(full);
+  persist();
+  renderSessionList();
+  setSending(false);
+}
+
+function quickStart(text) {
+  document.getElementById('userInput').value = text;
+  send(text);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Render Messages
+   ══════════════════════════════════════════════════════════════ */
+function appendMessage(role, content, isStreaming) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = role==='user'
+    ? `<div class="bubble">${esc(content)}</div>`
+    : `<div class="meta">🤖 诊断助手</div><div class="bubble">${isStreaming ? content : renderContent(content)}</div>`;
+  msgs.appendChild(div);
+  return div;
+}
+
+function updateBubble(el, content) {
+  const bubble = el.querySelector('.bubble');
+  if (bubble) bubble.innerHTML = renderContent(content);
+}
+
+function renderContent(text) {
+  if (!text) return '';
+
+  let prefixHtml = '';  // HTML blocks to prepend after markdown conversion
+  let suffixHtml = '';  // HTML blocks to append after markdown conversion
+
+  // Safety alert — extract HTML, remove raw text
+  if (text.includes('安全警示')) {
+    text = text.replace(/## ⚠️ 安全警示[\s\S]*?(?=##|\n\n|$)/gm, m => {
+      const body = esc(m.replace(/## ⚠️ 安全警示\n\n?/,'')).replace(/\n/g,'<br>');
+      prefixHtml += `<div class="safety-alert"><h4>⚠️ 安全警示</h4>${body}</div>`;
+      return '';
+    });
+  }
+
+  // Diagnostic conclusion card
+  if (text.includes('诊断结论') || text.includes('### 诊断结论') || text.includes('主要根因')) {
+    const confMatch = text.match(/置信度[：:]\s*(\d+)%/);
+    const causeMatch = text.match(/(?:主要根因|根因)[：:]\s*(.+)/);
+    const domainMatch = text.match(/(?:责任域|建议责任域)[：:]\s*(.+)/);
+
+    if (confMatch || causeMatch || domainMatch) {
+      const cause = causeMatch ? causeMatch[1].trim() : '—';
+      const conf = confMatch ? parseInt(confMatch[1]) : 0;
+      const domain = domainMatch ? domainMatch[1].trim() : '—';
+      const barClass = conf >= 70 ? 'high' : conf >= 40 ? 'mid' : 'low';
+      prefixHtml += `<div class="diag-card">
+        <h3>🏆 诊断结论</h3>
+        <div class="dc-row"><span class="dc-label">主要根因</span><span class="dc-val" style="font-weight:600;color:var(--title)">${esc(cause)}</span></div>
+        <div class="dc-row"><span class="dc-label">置信度</span><span class="dc-val">${conf}%</span></div>
+        <div class="bar-wrap"><div class="bar-fill ${barClass}" style="width:${conf}%"></div></div>
+        <div class="dc-row" style="margin-top:8px"><span class="dc-label">责任域</span><span class="dc-val">${esc(domain)}</span></div>
+      </div>`;
+      // Remove the raw text version to avoid duplication
+      text = text.replace(/##\s*诊断结论[\s\S]*?(?=###|$)/, '').replace(/🏆\s*诊断结论[\s\S]*?(?=###|$)/, '');
+    }
+
+    // Action buttons — extract HTML, remove raw text
+    if (text.includes('创建') && text.includes('跳转') && text.includes('结案')) {
+      suffixHtml = `<div class="action-row">
+        <button class="action-btn primary" onclick="handleAction('create')">📝 创建问题单</button>
+        <button class="action-btn secondary" onclick="handleAction('platform')">🔗 跳转平台</button>
+        <button class="action-btn secondary" onclick="handleAction('close')">✅ 建议结案</button>
+      </div>`;
+      text = text.replace(/### 接下来需要我做什么？[\s\S]*$/m, '');
+    }
+  }
+
+  // Markdown → HTML (simple) — only on plain text, not injected HTML
+  let html = text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^\- (.+)$/gm,'<li>$1</li>')
+    .replace(/((?:\n<li>.+<\/li>)+)/g,'\n<ul>$1</ul>\n')
+    .replace(/\n{2,}/g,'\n\n')
+    .replace(/\n/g,'<br>')
+    .replace(/---/g,'<hr>');
+
+  return prefixHtml + html + suffixHtml;
+}
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* ══════════════════════════════════════════════════════════════
+   Action Buttons
+   ══════════════════════════════════════════════════════════════ */
+function handleAction(action) {
+  if (action === 'platform') {
+    store.history.push({role:'user',content:'跳转'});
+    store.history.push({role:'assistant',content:'ALM 平台地址：https://alm.byd.com/issues\n\n可直接在平台查看或创建问题单。'});
+    persist();
+    render();
+    return;
+  }
+  const msg = action === 'create' ? '创建' : '结案';
+  store.history.push({role:'user',content:msg});
+  appendMessage('user', msg);
+  scrollDown();
+  sendActionReply(msg);
+}
+
+async function sendActionReply(msg) {
+  setSending(true);
+  const placeholder = appendMessage('assistant','<div class="typing"><span></span><span></span><span></span></div>',true);
+  try {
+    const resp = await fetch(BASE+'/api/v1/chat/stream',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:'web',session_id:store.activeSid,message:msg,role:store.role})
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf='',full='';
+    while(true){
+      const {done,value}=await reader.read();
+      if(done) break;
+      buf+=decoder.decode(value,{stream:true});
+      const lines=buf.split('\n\n');
+      buf=lines.pop();
+      for(const l of lines){
+        const line=l.trim();
+        if(!line.startsWith('data: ')) continue;
+        try{
+          const d=JSON.parse(line.slice(6));
+          if(d.type==='token'){full+=d.content;updateBubble(placeholder,full);scrollDown();}
+          else if(d.type==='done'){updateBubble(placeholder,full||d.content);}
+          else if(d.type==='error'){updateBubble(placeholder,'⚠️ '+d.message);}
+        }catch(e){}
+      }
+    }
+  }catch(e){updateBubble(placeholder,'⚠️ 请求失败: '+e.message);}
+  store.history.push({role:'assistant',content:full||''});
+  updateBubble(placeholder,full||'');
+  updateContextPanel(full||'');
+  persist();
+  setSending(false);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Context Panel
+   ══════════════════════════════════════════════════════════════ */
+function updateContextPanel(text) {
+  const el = document.getElementById('contextContent');
+  if (!text) return;
+
+  // Extract phase
+  let phaseHtml = '', phenomenaHtml = '', causeHtml = '';
+
+  // Confidence
+  const confMatch = text.match(/置信度[：:]\s*(\d+)%/);
+  if (confMatch) {
+    const c = parseInt(confMatch[1]);
+    const cl = c>=70?'high':c>=40?'mid':'low';
+    phaseHtml = `<div class="cp-card">
+      <div class="label">当前阶段</div>
+      <span class="phase-tag conclude">结论已生成</span>
+    </div>
+    <div class="cp-card">
+      <div class="label">置信度</div>
+      <div class="value">${c}%</div>
+      <div class="bar-wrap"><div class="bar-fill ${cl}" style="width:${c}%"></div></div>
+    </div>`;
+  }
+
+  // Candidate causes
+  const causeRegex = /(\S+)\s*\((\d+)%\)/g;
+  let cm;
+  const causes = [];
+  while ((cm = causeRegex.exec(text)) !== null) {
+    if (cm[1].length < 30) causes.push({name:cm[1],conf:parseInt(cm[2])});
+  }
+  if (causes.length) {
+    causeHtml = `<div class="cp-card"><div class="label">候选根因</div><ul class="cause-list">`+
+      causes.slice(0,5).map((c,i)=>`<li>
+        <span class="rank">${i+1}</span>
+        <span class="cn">${esc(c.name)}</span>
+        <span class="cc">${c.conf}%</span>
+      </li>`).join('')+'</ul></div>';
+  }
+
+  // Confirmed phenomena
+  const phenomMatch = text.match(/已确认[的]?现象[：:](.+)/);
+  if (phenomMatch) {
+    const phenoms = phenomMatch[1].split(/[、,，]/).filter(Boolean);
+    phenomenaHtml = `<div class="cp-card"><div class="label">已确认现象</div>`+
+      phenoms.map(p=>`<span class="phenom-tag confirmed">✓ ${esc(p.trim())}</span>`).join('')+
+      '</div>';
+  }
+
+  el.innerHTML = `<div class="cp-title">📊 诊断上下文</div>${phaseHtml}${causeHtml}${phenomenaHtml}`;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Session List
+   ══════════════════════════════════════════════════════════════ */
+function renderSessionList() {
+  const el = document.getElementById('sessionList');
+  const q = (document.getElementById('sessionSearch')?.value||'').toLowerCase();
+  let filtered = store.sessions;
+  if (q) filtered = filtered.filter(s=>s.title.toLowerCase().includes(q));
+
+  // Group by date
+  const today = new Date().toDateString();
+  const yesterday = new Date(Date.now()-864e5).toDateString();
+  const groups = { today:[], yesterday:[], older:[] };
+
+  for (const s of filtered) {
+    const d = new Date(s.createdAt).toDateString();
+    if (d===today) groups.today.push(s);
+    else if (d===yesterday) groups.yesterday.push(s);
+    else groups.older.push(s);
+  }
+
+  let html = '';
+  for (const [key,label] of [['today','📌 今天'],['yesterday','📅 昨天'],['older','📅 更早']]) {
+    if (!groups[key].length) continue;
+    html += `<div class="group-label">${label}</div>`;
+    for (const s of groups[key]) {
+      const isActive = s.id === store.activeSid;
+      const lastMsg = s.messages && s.messages.length ? s.messages[s.messages.length-1] : null;
+      const dotClass = lastMsg && lastMsg.role==='assistant' && lastMsg.content.includes('置信度') ? 'done' :
+                       lastMsg ? 'progress' : 'open';
+      html += `<div class="session-item${isActive?' active':''}" onclick="switchSession('${s.id}')">
+        <div class="si-dot ${dotClass}"></div>
+        <div class="si-info">
+          <div class="si-title">${esc(s.title)}</div>
+          <div class="si-meta">${timeAgo(s.createdAt)} · ${s.messages?.length||0} 条消息</div>
+        </div>
+        <button class="icon-btn" style="font-size:12px;opacity:0" onclick="event.stopPropagation();deleteSession('${s.id}')" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0'">🗑</button>
+      </div>`;
+    }
+  }
+  if (!html) html = '<div style="text-align:center;color:var(--muted);padding:20px;font-size:13px">暂无会话<br>点击「+ 新建诊断」开始</div>';
+  el.innerHTML = html;
+}
+
+function timeAgo(iso) {
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff/6e4);
+  if (mins<1) return '刚刚';
+  if (mins<60) return mins+' 分钟前';
+  const hrs = Math.floor(mins/60);
+  if (hrs<24) return hrs+' 小时前';
+  return Math.floor(hrs/24)+' 天前';
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Full Re-render
+   ══════════════════════════════════════════════════════════════ */
+function render() {
+  const msgs = document.getElementById('messages');
+  const welcome = document.getElementById('welcomeScreen');
+  msgs.innerHTML = '';
+
+  if (!store.history || !store.history.length) {
+    if (welcome) welcome.style.display = '';
+    document.getElementById('contextContent').innerHTML =
+      `<div class="cp-title">📊 诊断上下文</div>
+       <div class="cp-card" style="text-align:center;padding:40px 12px;">
+         <div style="font-size:36px;margin-bottom:8px;">🔬</div>
+         <div style="color:var(--muted);font-size:13px;">开始诊断后将在此展示<br>置信度、候选根因等信息</div>
+       </div>`;
+    return;
+  }
+
+  if (welcome) welcome.style.display = 'none';
+  for (const m of store.history) {
+    appendMessage(m.role, m.content);
+  }
+  const lastAssistant = [...store.history].reverse().find(m=>m.role==='assistant');
+  if (lastAssistant) updateContextPanel(lastAssistant.content);
+  setTimeout(scrollDown, 50);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Helpers
+   ══════════════════════════════════════════════════════════════ */
+function scrollDown() {
+  const area = document.getElementById('chatArea');
+  setTimeout(()=>{ area.scrollTop = area.scrollHeight; }, 30);
+}
+
+function setSending(v) {
+  document.getElementById('sendBtn').disabled = v;
+  document.getElementById('userInput').disabled = v;
+}
+
+function toggleTheme() {
+  const isDark = document.documentElement.getAttribute('data-theme')==='dark';
+  document.documentElement.setAttribute('data-theme', isDark?'':'dark');
+  store.theme = isDark?'light':'dark';
+  localStorage.setItem('rd_theme',store.theme);
+}
+
+function onRoleChange() {
+  store.role = document.getElementById('roleSelect').value;
+  localStorage.setItem('rd_role',store.role);
+}
+
+init();
+</script>
+</body>
+</html>

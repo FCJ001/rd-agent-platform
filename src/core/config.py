@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # ---------------- 项目二（知识服务，步 7 才用到）----------------
     KNOWLEDGE_SVC_URL: str = "http://localhost:8001"
 
+    # ---------------- ChatBI 独立服务（BI 查询，多数据源平台）----------------
+    BI_SVC_URL: str = "http://localhost:8004"
+    BI_PROJECT_ID: str = "rd_agent"  # 对应 rd-chatBI 的 bi_datasources.code
+
     # ---------------- Java ALM 平台（开发期 logger 占位）----------------
     PLATFORM_ALM_URL: str = "https://alm.internal"
     PLATFORM_ALM_API_URL: str = "https://alm.internal/api"

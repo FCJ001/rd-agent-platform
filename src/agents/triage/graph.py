@@ -253,6 +253,18 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
 async def node_ask_details(state: TriageState, deps: TriageDeps) -> dict:
     """节点④：LLM 生成追问（问伴随现象、DTC、发生条件、频次）。"""
     logger.info(f"[TRIAGE] 节点④ ask_details round={state.round} candidates={len(state.candidate_causes)}")
+
+    # ★ 终止守卫：L1 全程抽不出现象时永远到不了 query_candidates，
+    #   MAX_ROUNDS 原本只在 query 路径判收敛 —— 这里补上，避免无限追问。
+    if state.round >= MAX_ROUNDS:
+        logger.warning(
+            f"[TRIAGE] 节点④ 轮次耗尽 round={state.round} 仍无有效现象 → 强制收敛"
+        )
+        return {
+            "phase": TriagePhase.CONCLUDE,
+            "force_conclude": True,
+        }
+
     candidate_summary = "\n".join(
         f"- {c.name}（置信度 {c.confidence:.0%}，匹配现象: {', '.join(c.matched_phenomena)}"
         f"{'，未命中: ' + ', '.join([p for p in c.all_phenomena if p not in c.matched_phenomena]) if c.all_phenomena else ''}"
@@ -329,10 +341,21 @@ async def node_conclude(state: TriageState, deps: TriageDeps) -> dict:
     logger.info(f"[TRIAGE] 节点⑥ conclude round={state.round} candidates={len(state.candidate_causes)} viewer_role={state.viewer_role}")
     candidates = state.candidate_causes
     if not candidates:
-        no_result = "根据您描述的故障现象，暂未在知识库中找到高置信度匹配的根因。建议实车诊断确认。"
+        if not state.confirmed_phenomena:
+            # 多轮都没抽出现象（可能是描述过短/答非所问/词表覆盖不到）
+            no_result = (
+                "多次询问后仍未识别出有效的故障现象描述，无法进行匹配诊断。"
+                "请重新描述，尽量包含具体现象（如「中控屏黑屏」「充电时跳闸」）、"
+                "发生条件（如冷车/行驶中/充电时）和伴随情况（如异响、告警灯、DTC 故障码）。"
+            )
+        else:
+            # 有现象但知识库匹配不到
+            no_result = "根据您描述的故障现象，暂未在知识库中找到高置信度匹配的根因。建议实车诊断确认。"
         return {
             "phase": TriagePhase.CONCLUDE,
             "diagnostic_summary": no_result,
+            # 收敛后清除遗留追问，避免状态里残留上一轮 ASK 的旧问题
+            "follow_up_questions": [],
             "messages": [AIMessage(content=no_result)],
         }
 
@@ -444,6 +467,13 @@ def route_after_conclude(state: TriageState) -> str:
     return "end"
 
 
+def route_after_ask(state: TriageState) -> str:
+    """追问后：轮次耗尽强制收敛 → conclude，否则本轮结束等用户下一条消息。"""
+    if state.phase == TriagePhase.CONCLUDE:
+        return "conclude"
+    return "end"
+
+
 # ════════════════════════════════════════════════════════════════════════
 # 图组装
 # ════════════════════════════════════════════════════════════════════════
@@ -475,10 +505,14 @@ def build_triage_graph(deps: TriageDeps):
 
     # 固定边
     graph.add_edge("load_issue", "extract_phenomena")
-    graph.add_edge("ask_details", END)
     graph.add_edge("save_record", END)
 
     # 条件边
+    # ask_details：轮次耗尽（空提取守卫）→ conclude，否则本轮结束等用户下一条消息
+    graph.add_conditional_edges("ask_details", route_after_ask, {
+        "conclude": "conclude",
+        "end": END,
+    })
     graph.add_conditional_edges("dispatcher", route_dispatcher, {
         "load_issue": "load_issue",
         "parse_answer": "parse_answer",

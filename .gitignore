@@ -26,6 +26,7 @@ data/eval/
 
 # 面试准备文档（不提交）
 interview/
+interview-guide/
 
 # IDE
 .idea/
