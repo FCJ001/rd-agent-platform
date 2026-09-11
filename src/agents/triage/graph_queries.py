@@ -93,6 +93,10 @@ def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCaus
     for c in candidates:
         all_ph = phenom_map.get(c.code, [])
         c.all_phenomena = [p["name"] for p in all_ph]
+        # 现象名 → INDICATES.weight（反馈回写实时值），置信度评分用作证据调制（C1）
+        c.phenomena_weight = {
+            p["name"]: float(p.get("weight") or 0.0) for p in all_ph if p.get("weight") is not None
+        }
         c.is_core_match = any(
             p["is_core"] and p["name"] in c.matched_phenomena
             for p in all_ph

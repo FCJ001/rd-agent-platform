@@ -16,11 +16,13 @@ EXTRACT_PHENOMENA_PROMPT = """你是汽车研发领域的故障诊断专家。�
 请以 JSON 格式输出：
 {{
   "phenomena": ["现象名1", "现象名2"],
+  "hedged_phenomena": ["用户用"好像/可能/不确定"等模糊语气提到的现象名"],
   "dtc_codes": ["DTC码1"]
 }}
 
 要求：
 - 只从词汇表中选择最匹配的现象名（1-3 个）
+- phenomena 放用户明确描述的现象；hedged_phenomena 放语气不确定的现象（如"好像是黑屏"），两类不重复
 - 如果用户描述中没有提到 DTC 码，dtc_codes 为空数组
 - 只输出 JSON，不要解释。"""
 

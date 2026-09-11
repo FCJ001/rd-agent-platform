@@ -48,7 +48,7 @@ NL2CYPHER_PROMPT = """你是 Neo4j Cypher 查询专家。根据用户问题和�
 - Baseline（基线）：属性 name, baseline_no, business_line, is_frozen
 
 关系类型：
-- (Phenomenon)-[:INDICATES {{weight, is_core}}]->(RootCause)    现象指示根因
+- (RootCause)-[:INDICATES {{weight, is_core}}]->(Phenomenon)    根因指示现象（方向与 init_neo4j.py 建边一致，勿反向）
 - (RootCause)-[:BELONGS_TO]->(OwnerDomain)                      根因归属责任域
 - (DTC)-[:POINTS_TO]->(RootCause)                               DTC 指向根因
 - (RootCause)-[:LOCATED_IN]->(ConfigItem)                       根因定位到配置项
@@ -127,6 +127,12 @@ async def search_graph_raw(
             async with neo4j_driver.session() as session:
                 result = await session.run(cypher)
                 records = await result.data()
+                if not records:
+                    # 空结果必须显式暴露：方向写反/关系缺失导致的静默失效，上游 impact 层
+                    # 的 try/except 不会报错，只能靠这条告警定位
+                    logger.warning(
+                        f"[GraphRAG] 查询返回空 question={question[:80]} cypher={cypher[:120]}"
+                    )
                 return records[:20]
         except Exception as e:
             error_hint = str(e)

@@ -1,6 +1,7 @@
 """分诊 StateGraph。参考天宫医疗版 inquiry/graph.py（10 节点拓扑）。"""
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -19,7 +20,11 @@ from src.agents.triage.db_queries import (
     lookup_dtc_codes, save_triage_result,
 )
 from src.agents.triage.graph_queries import query_causes_by_phenomena, enrich_cause_details
-from src.agents.triage.confidence import apply_context_weights, check_convergence, MAX_ROUNDS
+from src.agents.triage.confidence import (
+    apply_context_weights, check_convergence, merge_evidence, MAX_ROUNDS,
+    EVIDENCE_GRADE_INSTRUMENT, EVIDENCE_GRADE_REPORTED,
+    EVIDENCE_GRADE_CONFIRMED, EVIDENCE_GRADE_HEDGED,
+)
 from src.core.config import get_settings
 from src.core.logger import logger
 
@@ -133,27 +138,43 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
     try:
         parsed = _parse_llm_json(response)
         new_phenomena = parsed.get("phenomena", [])
+        hedged = parsed.get("hedged_phenomena", [])
         new_dtc = parsed.get("dtc_codes", [])
     except Exception:
         logger.warning(f"[TRIAGE] 节点② LLM JSON 解析失败")
         new_phenomena = []
+        hedged = []
         new_dtc = []
 
-    logger.info(f"[TRIAGE] 节点② extracted phenomena={new_phenomena} dtc={new_dtc}")
+    logger.info(f"[TRIAGE] 节点② extracted phenomena={new_phenomena} hedged={hedged} dtc={new_dtc}")
 
     # Merge with existing
     all_confirmed = list(set(state.confirmed_phenomena) | set(new_phenomena))
     all_dtc = list(set(state.dtc_codes) | set(new_dtc))
 
+    # 证据分级（C1）：自发描述 > 追问确认；模糊语气单独降级；
+    # 问题单 DTC 快照来自车端上报，视为仪器级证据
+    phenom_evidence_updates = {
+        p: (EVIDENCE_GRADE_HEDGED if p in hedged else EVIDENCE_GRADE_REPORTED)
+        for p in new_phenomena
+    }
+    dtc_evidence_updates = {d: EVIDENCE_GRADE_REPORTED for d in new_dtc}
+    if state.issue_dtc_snapshot and state.round == 0:
+        for d in re.findall(r"[A-Z]\d{4,5}", state.issue_dtc_snapshot):
+            dtc_evidence_updates[d] = EVIDENCE_GRADE_INSTRUMENT
+
     if all_confirmed:
         return {
             "confirmed_phenomena": all_confirmed,
             "dtc_codes": all_dtc,
+            "phenomena_evidence": merge_evidence(state.phenomena_evidence, phenom_evidence_updates),
+            "dtc_evidence": merge_evidence(state.dtc_evidence, dtc_evidence_updates),
             "phase": TriagePhase.QUERY,
         }
     else:
         return {
             "dtc_codes": all_dtc,
+            "dtc_evidence": merge_evidence(state.dtc_evidence, dtc_evidence_updates),
             "phase": TriagePhase.ASK,
         }
 
@@ -224,7 +245,9 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
                 pass  # dtc matching is handled in graph_queries.enrich_cause_details
 
         candidates = apply_context_weights(
-            candidates, state.dtc_codes, state.denied_phenomena
+            candidates, state.dtc_codes, state.denied_phenomena,
+            phenomena_evidence=state.phenomena_evidence,
+            dtc_evidence=state.dtc_evidence,
         )
 
     should_conclude, force_conclude = check_convergence(candidates, state.round)
@@ -323,15 +346,22 @@ async def node_parse_answer(state: TriageState, deps: TriageDeps) -> dict:
         new_dtc = list(
             set(state.dtc_codes) | set(parsed.get("dtc_codes", []))
         )
+        # 追问后确认的现象有引导性（用户顺着问回答），定级低于自发描述（C1）
+        phenom_evidence_updates = {p: EVIDENCE_GRADE_CONFIRMED for p in parsed.get("confirmed", [])}
+        dtc_evidence_updates = {d: EVIDENCE_GRADE_REPORTED for d in parsed.get("dtc_codes", [])}
     except Exception:
         new_confirmed = state.confirmed_phenomena
         new_denied = state.denied_phenomena
         new_dtc = state.dtc_codes
+        phenom_evidence_updates = {}
+        dtc_evidence_updates = {}
 
     return {
         "confirmed_phenomena": new_confirmed,
         "denied_phenomena": new_denied,
         "dtc_codes": new_dtc,
+        "phenomena_evidence": merge_evidence(state.phenomena_evidence, phenom_evidence_updates),
+        "dtc_evidence": merge_evidence(state.dtc_evidence, dtc_evidence_updates),
         "phase": TriagePhase.QUERY,
     }
 

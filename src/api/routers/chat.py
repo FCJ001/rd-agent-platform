@@ -1,26 +1,25 @@
-"""统一对话入口。含分诊 bypass：追问轮次绕过 Supervisor 直连 StateGraph。"""
+"""统一对话入口。
+
+B2 重构后没有"分诊 bypass"：分诊多轮追问由 call_triage_agent 工具内的
+langgraph interrupt() 驱动，回合控制权在 Supervisor checkpointer。
+本路由只做一件事 —— 看快照里有没有挂起的 interrupt：
+  - 有 → 用户这条消息是追问的回答，Command(resume) 恢复图继续跑
+  - 无 → 正常作为新消息进 Supervisor
+"""
 
 import json
-import time
-import traceback
 import uuid
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from langchain_community.embeddings import DashScopeEmbeddings
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from src.agents.supervisor_agent import get_supervisor_agent
-from src.agents.triage.graph import run_triage, TriageDeps
-from src.core.deps import UserContext, get_current_user
-from src.agents.triage.state import TriageState, TriagePhase
+from src.core.deps import UserContext
 from src.core.base_schema import ResponseSchema
-from src.core.config import get_settings
 from src.core.logger import logger
-from src.infra.redis_cache import get_checkpointer_redis
-from src.infra.milvus_client import get_milvus_client_alias
-from src.infra.milvus_store import MilvusStore
-from src.infra.db import AsyncSessionLocal
+from src.utils.mask import mask_free_text
 
 router = APIRouter(prefix="/api/v1/chat", tags=["智能对话"])
 
@@ -37,86 +36,28 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
-_milvus_store = None
+def _user_ctx(req: ChatRequest) -> UserContext:
+    return UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role,
+                       business_line=None, owner_domain_id=None)
 
 
-def _get_milvus_store() -> MilvusStore:
-    global _milvus_store
-    if _milvus_store is None:
-        s = get_settings()
-        alias = get_milvus_client_alias()
-        embedding_model = DashScopeEmbeddings(model="text-embedding-v3", dashscope_api_key=s.DASHSCOPE_API_KEY)
-        _milvus_store = MilvusStore(alias=alias, embeddings=embedding_model, dims=1024)
-    return _milvus_store
+async def _has_pending_triage(agent, config: dict) -> bool:
+    """快照里有挂起的 interrupt = 分诊工具正在等用户的追问回答。"""
+    snapshot = await agent.aget_state(config)
+    return any(task.interrupts for task in snapshot.tasks)
 
 
-async def _save_diagnosis_memory(state: TriageState, thread_id: str) -> None:
-    """诊断收敛后将结论写入长期记忆，供 search_memory 检索。"""
-    if not state.candidate_causes:
-        return
+def _reply_from_result(result: dict) -> str:
+    """从图运行结果提取给用户的回复。
 
-    top = state.candidate_causes[0]
-    user_id = thread_id.split(":")[0]
-
-    phenomena_str = "、".join(state.confirmed_phenomena) if state.confirmed_phenomena else "未知"
-    dtc_str = "、".join(state.dtc_codes) if state.dtc_codes else "无"
-
-    content = (
-        f"诊断结论：{top.name}({top.code}) 置信度{top.confidence:.0%}，"
-        f"现象={phenomena_str}，DTC={dtc_str}。{state.diagnostic_summary}"
-    )
-
-    store = _get_milvus_store()
-    key = f"diagnosis_{int(time.time())}"
-    await store.aput(
-        namespace=("users", user_id, "memories"),
-        key=key,
-        value={"content": content, "timestamp": time.time()},
-    )
-    logger.info(f"[CHAT] saved diagnosis memory for user={user_id}: {content[:120]}...")
-
-
-async def _build_triage_deps():
-    from src.agents.triage.graph import _get_llm_json, _get_llm_chat
-
-    llm_json = _get_llm_json()
-    llm_chat = _get_llm_chat()
-
-    async def _db_factory():
-        async with AsyncSessionLocal() as session:
-            yield session
-
-    return TriageDeps(llm_json=llm_json, llm_chat=llm_chat, db_session_factory=_db_factory)
-
-
-async def _run_triage_turn(message: str, thread_id: str, redis, role: str = "customer") -> str:
-    """执行一轮分诊对话（绕过 Supervisor，直连 StateGraph）。"""
-    active_key = f"triage_active:{thread_id}"
-    state_key = f"triage_state:{thread_id}"
-
-    # 从 Redis 恢复上一轮状态
-    raw = await redis.get(state_key)
-    existing_state = TriageState.model_validate_json(raw) if raw else None
-
-    deps = await _build_triage_deps()
-    reply, new_state = await run_triage(
-        user_message=message,
-        thread_id=thread_id,
-        deps=deps,
-        existing_state=existing_state,
-        viewer_role=role,
-    )
-
-    # 收敛：保存长期记忆 → 清除 Redis 标记
-    if new_state.phase == TriagePhase.CONCLUDE:
-        await _save_diagnosis_memory(new_state, thread_id)
-        await redis.delete(active_key, state_key)
-        return reply
-
-    # 未收敛：更新 Redis 状态，重置 TTL
-    await redis.set(state_key, new_state.model_dump_json(), ex=3600)
-    await redis.set(active_key, "1", ex=3600)
-    return reply
+    ★ 分诊追问轮图会暂停在工具内：最后一条消息是模型的 tool_call（content
+    为空），追问文本只在 interrupt payload 里，必须从这里取。
+    """
+    interrupts = result.get("__interrupt__")
+    if interrupts:
+        question = (interrupts[0].value or {}).get("question", "")
+        return question or "请继续描述故障细节。"
+    return result["messages"][-1].content
 
 
 @router.post("", response_model=ResponseSchema[ChatResponse])
@@ -124,37 +65,33 @@ async def chat(req: ChatRequest):
     """
     统一对话接口。
 
-    路由逻辑：
-    - 分诊进行中（triage_active flag → Redis）→ 绕过 Supervisor，直连 StateGraph
-    - 无活跃分诊 → 走 Supervisor 决策路由
+    路由依据（单一控制面 = Supervisor checkpointer）：
+    - 分诊工具挂起等待追问回答（interrupt）→ Command(resume) 恢复
+    - 否则 → 作为新消息进 Supervisor 决策路由
     """
     try:
-        redis = get_checkpointer_redis()
-        thread_id = f"{req.user_id}:{req.session_id}"
-        active_key = f"triage_active:{thread_id}"
-
-        # ── 分诊进行中：绕过 Supervisor ──
-        if await redis.exists(active_key):
-            logger.info(f"[CHAT] triage bypass user={req.user_id} session={req.session_id}")
-            reply = await _run_triage_turn(req.message, thread_id, redis, role=req.role)
-            return ResponseSchema(data=ChatResponse(reply=reply, session_id=req.session_id))
-
-        # ── 无活跃分诊：走 Supervisor ──
         agent = await get_supervisor_agent()
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": f"{req.user_id}:{req.session_id}"}}
+        ctx = _user_ctx(req)
 
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": req.message}]},
-            config=config,
-            context=UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role,
-                               business_line=None, owner_domain_id=None),
-        )
-        reply = result["messages"][-1].content
+        # 原始敏感数据不进 LLM：自由文本先打码（VIN/手机号）
+        message = mask_free_text(req.message)
+
+        if await _has_pending_triage(agent, config):
+            logger.info(f"[CHAT] triage resume user={req.user_id} session={req.session_id}")
+            result = await agent.ainvoke(Command(resume=message), config=config, context=ctx)
+        else:
+            result = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": message}]},
+                config=config, context=ctx,
+            )
+
+        reply = _reply_from_result(result)
         return ResponseSchema(data=ChatResponse(reply=reply, session_id=req.session_id))
 
     except Exception as e:
         logger.exception("chat 接口异常")
-        raise HTTPException(status_code=500, detail=traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── SSE 流式接口 ────────────────────────────────────────────────────────────
@@ -169,9 +106,7 @@ async def chat_stream(req: ChatRequest):
     """
     流式对话接口（Server-Sent Events）。
 
-    路由逻辑与同步接口一致：
-    - 分诊进行中 → 绕过 Supervisor，直连 StateGraph（整体推送）
-    - 无活跃分诊 → Supervisor 流式推送
+    路由逻辑与同步接口一致（checkpointer 快照决定 resume 或新消息）。
 
     SSE 帧格式：
         data: {"type":"token","content":"..."}
@@ -181,33 +116,32 @@ async def chat_stream(req: ChatRequest):
     async def event_generator():
         trace_id = str(uuid.uuid4())[:12]
         try:
-            redis = get_checkpointer_redis()
-            thread_id = f"{req.user_id}:{req.session_id}"
-            active_key = f"triage_active:{thread_id}"
+            agent = await get_supervisor_agent()
+            config = {"configurable": {"thread_id": f"{req.user_id}:{req.session_id}"}}
+            ctx = _user_ctx(req)
+            message = mask_free_text(req.message)
 
-            # ── 分诊进行中：绕开 Supervisor，整体推送 ──
-            if await redis.exists(active_key):
-                logger.info(f"[CHAT/STREAM] triage bypass user={req.user_id} session={req.session_id}")
-                reply = await _run_triage_turn(req.message, thread_id, redis, role=req.role)
-                yield _sse_frame({"type": "token", "content": reply})
-
+            if await _has_pending_triage(agent, config):
+                logger.info(f"[CHAT/STREAM] triage resume user={req.user_id} session={req.session_id}")
+                payload = Command(resume=message)
             else:
-                # ── 无活跃分诊：Supervisor 流式推送 ──
-                agent = await get_supervisor_agent()
-                config = {"configurable": {"thread_id": thread_id}}
-                ctx = UserContext(user_id=req.user_id, session_id=req.session_id, role=req.role,
-                                  business_line=None, owner_domain_id=None)
+                payload = {"messages": [{"role": "user", "content": message}]}
 
-                async for chunk in agent.astream(
-                    {"messages": [{"role": "user", "content": req.message}]},
-                    config=config,
-                    context=ctx,
-                    stream_mode="messages",
-                ):
-                    if isinstance(chunk, tuple):
-                        msg_chunk, _ = chunk
-                        if hasattr(msg_chunk, "content") and msg_chunk.content:
-                            yield _sse_frame({"type": "token", "content": msg_chunk.content})
+            async for chunk in agent.astream(
+                payload, config=config, context=ctx, stream_mode="messages",
+            ):
+                if isinstance(chunk, tuple):
+                    msg_chunk, _ = chunk
+                    if hasattr(msg_chunk, "content") and msg_chunk.content:
+                        yield _sse_frame({"type": "token", "content": msg_chunk.content})
+
+            # 分诊追问轮图暂停在工具内，问题文本不经过消息流，从快照补推
+            snapshot = await agent.aget_state(config)
+            for task in snapshot.tasks:
+                for intr in task.interrupts:
+                    question = (intr.value or {}).get("question", "")
+                    if question:
+                        yield _sse_frame({"type": "token", "content": question})
 
             yield _sse_frame({"type": "done", "session_id": req.session_id})
 

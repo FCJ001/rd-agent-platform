@@ -1,11 +1,16 @@
 """问题去重匹配器。架构设计：双门槛 —— 向量相似 + 结构化精确匹配。
 
 is_dup = sim_score >= 0.88 and (same_model_and_sw or same_dtc)
+
+召回层（门槛一）走 Milvus 向量检索（vector_index）：源文本只 embed 一次，
+近邻在 Milvus 内检索，不再把候选逐条 embed + 本地算余弦。
+Milvus 不可用时自动降级旧的暴力路径（加载近 90 天候选逐条 embed），
+降级是性能损失，不影响正确性。门槛二（车型+软件版本 / DTC 重叠）
+始终在 PG 侧做精确匹配。
 """
 
+import asyncio
 from dataclasses import dataclass, field
-
-from langchain_community.embeddings import DashScopeEmbeddings
 
 from src.core.config import get_settings
 from src.core.logger import logger
@@ -32,20 +37,13 @@ class DedupResult:
     matches: list[DedupMatch] = field(default_factory=list)
 
 
-def _get_embedding_model():
+def get_embedding_model():
+    from langchain_community.embeddings import DashScopeEmbeddings
+
     return DashScopeEmbeddings(
         model="text-embedding-v3",
         dashscope_api_key=settings.DASHSCOPE_API_KEY,
     )
-
-
-def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = (sum(a * a for a in vec_a)) ** 0.5
-    norm_b = (sum(b * b for b in vec_b)) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _split_dtc(dtc_str: str | None) -> set[str]:
@@ -55,7 +53,7 @@ def _split_dtc(dtc_str: str | None) -> set[str]:
 
 
 class DedupMatcher:
-    """问题去重匹配器。双门槛：向量相似 (Milvus embedding) ≥ 0.88 + 结构化精确匹配。"""
+    """问题去重匹配器。双门槛：向量相似 (Milvus ANN) ≥ 0.88 + 结构化精确匹配。"""
 
     def __init__(self):
         self._embedding_model = None
@@ -63,7 +61,7 @@ class DedupMatcher:
     @property
     def embedding_model(self):
         if self._embedding_model is None:
-            self._embedding_model = _get_embedding_model()
+            self._embedding_model = get_embedding_model()
         return self._embedding_model
 
     async def detect(self, issue_id: int) -> DedupResult:
@@ -74,9 +72,7 @@ class DedupMatcher:
             logger.warning(f"[DEDUP] issue_id={issue_id} not found")
             return DedupResult(source_issue_id=issue_id)
 
-        candidates = await self._load_candidates_full(source["business_line"], exclude_id=issue_id)
-        logger.info(f"[DEDUP] candidates loaded: {len(candidates)}")
-        return await self._match(source, candidates, issue_id)
+        return await self._match(source, issue_id)
 
     async def detect_by_text(
         self, description: str, dtc_codes: str = "", business_line: str = "ia",
@@ -90,20 +86,17 @@ class DedupMatcher:
             "dtc_snapshot": dtc_codes,
             "model_code": model_code,
             "sw_version": sw_version,
+            "business_line": business_line,
         }
-        candidates = await self._load_candidates_full(business_line)
-        return await self._match(source, candidates, 0)
+        return await self._match(source, 0)
 
-    async def _match(
-        self, source: dict, candidates: list[dict], source_id: int,
-    ) -> DedupResult:
-        """双门槛匹配逻辑。"""
-        logger.info(f"[DEDUP] _match source_id={source_id} candidates={len(candidates)}")
+    # ── 匹配主流程 ───────────────────────────────────────────────
+
+    async def _match(self, source: dict, source_id: int) -> DedupResult:
+        """向量召回（Milvus，失败降级暴力扫描）→ 结构化门槛 → 判重。"""
+        logger.info(f"[DEDUP] _match source_id={source_id}")
         result = DedupResult(source_issue_id=source_id)
-        if not candidates:
-            return result
 
-        # ── 门槛一：向量相似 ──
         source_text = f"{source.get('title', '')} {source.get('description', '')}"
         source_dtc = _split_dtc(source.get("dtc_snapshot"))
         source_model = source.get("model_code", "")
@@ -115,48 +108,46 @@ class DedupMatcher:
             logger.warning(f"[DEDUP] embedding failed for source_id={source_id}")
             return result
 
+        # ── 门槛一：向量相似召回 ──
+        candidates: list[dict] = []
+        try:
+            from src.agents.dedup import vector_index
+
+            hits = await asyncio.to_thread(
+                vector_index.search_similar,
+                source_emb,
+                source.get("business_line", "") or "ia",
+                exclude_id=source_id or None,
+            )
+            logger.info(f"[DEDUP] milvus recall: {len(hits)} hits")
+            ids = [h["id"] for h in hits]
+            sim_by_id = {h["id"]: h["similarity"] for h in hits}
+            rows = await self._load_issues_by_ids(ids)
+            # 候选行附上召回相似度，交给统一的结构化门槛
+            candidates = [dict(row, _similarity=sim_by_id.get(row["id"], 0.0)) for row in rows]
+        except Exception as e:
+            logger.warning(f"[DEDUP] Milvus 召回失败，降级暴力扫描: {e}")
+            candidates = await self._match_bruteforce(source, source_id, source_emb)
+
+        # ── 门槛二：结构化精确匹配 ──
         for cand in candidates:
             cand_id = cand["id"]
             if cand_id == source_id:
                 continue
-
-            cand_text = f"{cand.get('title', '')} {cand.get('description', '')}"
-            try:
-                cand_emb = self.embedding_model.embed_query(cand_text)
-            except Exception:
-                continue
-
-            sim_score = _cosine_similarity(source_emb, cand_emb)
+            sim_score = cand.get("_similarity", 0.0)
             if sim_score < SIMILARITY_THRESHOLD:
                 continue
 
-            # ── 门槛二：结构化精确匹配 ──
-            cand_model = cand.get("model_code", "")
-            cand_sw = cand.get("sw_version", "")
-            cand_dtc = _split_dtc(cand.get("dtc_snapshot"))
-
-            same_model_and_sw = (
-                source_model and cand_model and source_model == cand_model
-                and source_sw and cand_sw and source_sw == cand_sw
+            match = self._structured_gate(
+                source_dtc=source_dtc,
+                source_model=source_model,
+                source_sw=source_sw,
+                cand=cand,
+                sim_score=sim_score,
             )
-            same_dtc = bool(source_dtc and cand_dtc and (source_dtc & cand_dtc))
-
-            if same_model_and_sw and same_dtc:
-                evidence = "model_and_sw+dtc"
-            elif same_model_and_sw:
-                evidence = "model_and_sw"
-            elif same_dtc:
-                evidence = "dtc"
-            else:
+            if match is None:
                 continue  # 向量过阈值但结构不匹配 → 不判定为重复
-
-            result.matches.append(DedupMatch(
-                issue_id=cand_id,
-                issue_no=cand.get("issue_no", ""),
-                title=cand.get("title", ""),
-                similarity=round(sim_score, 4),
-                evidence=evidence,
-            ))
+            result.matches.append(match)
 
         result.matches.sort(key=lambda x: x.similarity, reverse=True)
         result.is_duplicate = len(result.matches) > 0
@@ -169,6 +160,65 @@ class DedupMatcher:
             await self._save_dedup_links(source_id, result.matches)
 
         return result
+
+    @staticmethod
+    def _structured_gate(
+        source_dtc: set[str], source_model: str, source_sw: str,
+        cand: dict, sim_score: float,
+    ) -> DedupMatch | None:
+        """门槛二：车型+软件版本一致 / DTC 重叠，二者取其一才算重复。"""
+        cand_model = cand.get("model_code", "")
+        cand_sw = cand.get("sw_version", "")
+        cand_dtc = _split_dtc(cand.get("dtc_snapshot"))
+
+        same_model_and_sw = (
+            source_model and cand_model and source_model == cand_model
+            and source_sw and cand_sw and source_sw == cand_sw
+        )
+        same_dtc = bool(source_dtc and cand_dtc and (source_dtc & cand_dtc))
+
+        if same_model_and_sw and same_dtc:
+            evidence = "model_and_sw+dtc"
+        elif same_model_and_sw:
+            evidence = "model_and_sw"
+        elif same_dtc:
+            evidence = "dtc"
+        else:
+            return None
+
+        return DedupMatch(
+            issue_id=cand["id"],
+            issue_no=cand.get("issue_no", ""),
+            title=cand.get("title", ""),
+            similarity=round(sim_score, 4),
+            evidence=evidence,
+        )
+
+    async def _match_bruteforce(
+        self, source: dict, source_id: int, source_emb: list[float],
+    ) -> list[dict]:
+        """降级召回：Milvus 不可用时加载近 90 天候选，逐条 embed + 本地余弦。
+
+        返回的候选带 _similarity 字段，与 Milvus 路径同构。"""
+        candidates = await self._load_candidates_full(
+            source.get("business_line", "") or "ia", exclude_id=source_id
+        )
+        logger.info(f"[DEDUP] bruteforce candidates loaded: {len(candidates)}")
+
+        def _score(cand: dict) -> float | None:
+            cand_text = f"{cand.get('title', '')} {cand.get('description', '')}"
+            try:
+                cand_emb = self.embedding_model.embed_query(cand_text)
+            except Exception:
+                return None
+            return _cosine_similarity(source_emb, cand_emb)
+
+        scored = []
+        for cand in candidates:
+            sim = await asyncio.to_thread(_score, cand)
+            if sim is not None:
+                scored.append(dict(cand, _similarity=sim))
+        return scored
 
     async def _save_dedup_links(self, source_id: int, matches: list[DedupMatch]) -> None:
         """将去重结果写入 ai_dedup_links 影子表。"""
@@ -219,6 +269,35 @@ class DedupMatcher:
         except Exception:
             return None
 
+    async def _load_issues_by_ids(self, ids: list[int]) -> list[dict]:
+        """按 Milvus 召回的 id 批量加载候选行。"""
+        if not ids:
+            return []
+        import psycopg2
+        try:
+            conn = psycopg2.connect(
+                host=settings.DB_HOST, port=settings.DB_PORT,
+                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
+            )
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                "sw_version, business_line FROM alm_issues WHERE id = ANY(%s) "
+                "AND status IN ('open', 'analyzing')",
+                (ids,),
+            )
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return [
+                {"id": r[0], "issue_no": r[1], "title": r[2],
+                 "description": r[3] or "", "dtc_snapshot": r[4] or "",
+                 "model_code": r[5] or "", "sw_version": r[6] or "",
+                 "business_line": r[7] or ""}
+                for r in rows
+            ]
+        except Exception:
+            return []
+
     async def _load_candidates_full(self, business_line: str, exclude_id: int | None = None) -> list[dict]:
         import psycopg2
         try:
@@ -256,6 +335,15 @@ class DedupMatcher:
             ]
         except Exception:
             return []
+
+
+def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = (sum(a * a for a in vec_a)) ** 0.5
+    norm_b = (sum(b * b for b in vec_b)) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 _dedup_matcher: DedupMatcher | None = None

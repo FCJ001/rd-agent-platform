@@ -1,53 +1,90 @@
-"""Worker 工具：封装分诊 Agent 和去重匹配器为 Supervisor 可调用的 @tool。"""
+"""Worker 工具：封装分诊 Agent 和去重匹配器为 Supervisor 可调用的 @tool。
+
+B2 重构：call_triage_agent 用 langgraph interrupt() 驱动多轮追问 ——
+工具在图视角下恢复"单轮"语义（跑一轮、暂停等用户、恢复继续），
+回合控制权统一收敛到 Supervisor checkpointer，不再有路由层 Redis 标记。
+"""
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
+from langgraph.types import interrupt
 
-from src.agents.triage.graph import run_triage, TriageDeps, build_triage_graph
+from src.agents.triage.graph import run_triage
+from src.agents.triage.memory import save_diagnosis_memory
+from src.agents.triage.session_store import TriageSessionStore, is_triage_exit
 from src.agents.triage.state import TriagePhase
 from src.agents.workers.triage_agent import TriageAgent
 from src.core.deps import UserContext
+from src.core.logger import logger
 from src.infra.redis_cache import get_checkpointer_redis
+
+
+def _interrupt_payload(round_no: int, question: str) -> dict:
+    """暂停时抛给调用方的上下文，chat 层可据此渲染追问卡片。"""
+    return {"type": "triage_followup", "round": round_no, "question": question[:500]}
+
+
+async def _finish_triage(store: TriageSessionStore, thread_id: str, state, reply: str) -> str:
+    """收敛/终止：清工作状态 + 结论写长期记忆，结论文本回到 Supervisor 消息历史。"""
+    await store.clear(thread_id)
+    try:
+        await save_diagnosis_memory(state, thread_id)
+    except Exception as e:
+        logger.warning(f"[TRIAGE] 长期记忆保存失败 thread={thread_id}: {e}")
+    return reply
 
 
 @tool
 async def call_triage_agent(message: str, runtime: ToolRuntime[UserContext]) -> str:
-    """启动故障诊断流程。
+    """启动故障诊断流程，系统自动多轮追问直至给出结论。
     适用场景：用户描述车辆故障现象（如"车机黑屏"、"动力不足"、"充电异常"等），
-    需要系统化诊断、分析根因时。后续多轮追问由系统自动处理，无需再次调用。
+    需要系统化诊断、分析根因时。追问期间用户的回复由系统自动转交给诊断流程，
+    无需再次调用本工具；工具返回时即为最终诊断结论（或用户主动退出的提示）。
 
     Args:
         message: 用户描述的故障现象（原文传递，不要改写）
     """
-    session_id = runtime.context.session_id
     user_id = runtime.context.user_id
+    session_id = runtime.context.session_id
     role = runtime.context.role
+    thread_id = f"{user_id}:{session_id}"
 
     agent = TriageAgent()
     deps = agent._build_deps()
+    store = TriageSessionStore(get_checkpointer_redis())
 
-    # 首轮：初始化空状态，执行第一轮诊断
-    reply, new_state = await run_triage(
-        user_message=message,
-        thread_id=f"{user_id}:{session_id}",
-        deps=deps,
-        existing_state=None,
-        viewer_role=role,
-    )
+    saved = await store.load(thread_id)
+    if saved is None:
+        # 首轮：立即跑第一轮诊断；不收敛则落盘进度，进入追问循环
+        reply, state = await run_triage(
+            user_message=message, thread_id=thread_id, deps=deps,
+            existing_state=None, viewer_role=role,
+        )
+        if state.phase in (TriagePhase.CONCLUDE, TriagePhase.END):
+            return await _finish_triage(store, thread_id, state, reply)
+        await store.save(thread_id, state, reply)
+    else:
+        state, reply = saved.state, saved.reply
+        # 快进空转：resume 会让本工具从头重放，而图 checkpoint 只在节点完成时
+        # 落盘 —— 前面已完成的 state.round 轮的 interrupt() 带有记录值（历史回答），
+        # 必须按序空转消耗掉对齐位置，当前用户的回答才会落在循环里真正的
+        # interrupt() 上。不空转会索引错位，不快进则会重跑已完成轮次的 LLM 调用。
+        for _ in range(state.round):
+            interrupt(_interrupt_payload(0, ""))
 
-    # 首轮即收敛 → 直接返回结论
-    if new_state.phase == TriagePhase.CONCLUDE:
-        return reply
+    while True:
+        answer = interrupt(_interrupt_payload(state.round + 1, reply))
+        if is_triage_exit(answer):
+            await store.clear(thread_id)
+            return "分诊已按你的要求退出，本轮诊断作废。如需重新诊断，请直接描述故障现象。"
 
-    # 未收敛：保存状态到 Redis，设置 active flag，等待用户回复
-    redis = get_checkpointer_redis()
-    state_key = f"triage_state:{user_id}:{session_id}"
-    await redis.set(state_key, new_state.model_dump_json(), ex=3600)
-
-    active_key = f"triage_active:{user_id}:{session_id}"
-    await redis.set(active_key, "1", ex=3600)
-
-    return reply
+        reply, state = await run_triage(
+            user_message=answer, thread_id=thread_id, deps=deps,
+            existing_state=state, viewer_role=role,
+        )
+        if state.phase in (TriagePhase.CONCLUDE, TriagePhase.END):
+            return await _finish_triage(store, thread_id, state, reply)
+        await store.save(thread_id, state, reply)
 
 
 @tool

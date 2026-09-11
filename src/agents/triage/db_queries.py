@@ -4,17 +4,22 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.modules.alm.model import Phenomenon, RootCause, CausePhenomenon, OwnerDomain, DtcCode, AlmIssue
+from src.utils.mask import mask_free_text
 
 
 async def load_issue_context(db: AsyncSession, issue_id: int) -> dict | None:
-    """加载问题单上下文：标题、描述、DTC 快照。"""
+    """加载问题单上下文：标题、描述、DTC 快照。
+
+    标题/描述是自由文本，可能嵌着完整 VIN/手机号 —— 进 LLM 前兜底打码，
+    兜住存量数据未脱敏的情况（新数据在 sync/webhook 写入路径已脱敏）。
+    """
     issue = await db.get(AlmIssue, issue_id)
     if issue is None:
         return None
     return {
         "issue_id": issue.id,
-        "issue_title": issue.title or "",
-        "issue_desc": issue.description or "",
+        "issue_title": mask_free_text(issue.title) or "",
+        "issue_desc": mask_free_text(issue.description) or "",
         "issue_dtc_snapshot": issue.dtc_snapshot or "",
         "source": issue.source or "customer",
     }

@@ -22,6 +22,10 @@ class CandidateCause(BaseModel):
     base_confidence: float = 0.0
     matched_phenomena: list[str] = []
     all_phenomena: list[str] = []
+    # 现象名 → 图谱 INDICATES.weight（反馈回写更新过），评分时调制证据强度
+    phenomena_weight: dict[str, float] = {}
+    # 可解释性：逐条证据的得分推导，跟结论一起输出
+    evidence_trace: list[str] = []
     fix_way: str = ""
     fix_duration: str = ""
     verify_items: str = ""
@@ -44,6 +48,10 @@ class TriageState(BaseModel):
     # symptom/phenomenon tracking
     confirmed_phenomena: list[str] = []
     denied_phenomena: list[str] = []
+    # 现象/DTC → 证据来源（instrument/reported/confirmed/hedged），
+    # 供置信度评分区分"诊断仪测过"和"好像是"（C1）
+    phenomena_evidence: dict[str, str] = {}
+    dtc_evidence: dict[str, str] = {}
     # candidates
     candidate_causes: list[CandidateCause] = []
     # DTC codes extracted from user input

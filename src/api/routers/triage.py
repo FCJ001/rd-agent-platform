@@ -4,6 +4,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from src.agents.workers.triage_agent import get_triage_agent
+from src.agents.triage.session_store import TriageSessionStore
+from src.agents.triage.state import TriageState
 from src.core.base_schema import ResponseSchema
 from src.core.logger import logger
 from src.infra.redis_cache import get_checkpointer_redis
@@ -57,15 +59,13 @@ async def triage(req: TriageRequest):
     """
     logger.info(f"[TRIAGE] session={req.session_id or 'new'} input={req.raw_input[:80]}")
 
-    # 从 Redis 恢复上一轮状态（如有）
+    # 从 store 恢复上一轮状态（如有）—— key 规范与 chat 工具共用 TriageSessionStore
     existing_state = None
     if req.session_id:
-        redis = get_checkpointer_redis()
-        state_key = f"triage_state:{req.session_id}"
-        raw = await redis.get(state_key)
-        if raw:
-            import json
-            existing_state = json.loads(raw)
+        store = TriageSessionStore(get_checkpointer_redis())
+        progress = await store.load(req.session_id)
+        if progress:
+            existing_state = progress.state
 
     agent = get_triage_agent()
     result = await agent.diagnose(
@@ -75,12 +75,14 @@ async def triage(req: TriageRequest):
         existing_state=existing_state,
     )
 
-    # 如果未收敛，将状态写入 Redis 供下一轮使用
+    # 如果未收敛，将状态写入 store 供下一轮使用
     if result["status"] == "asking" and result["_state"]:
-        redis = get_checkpointer_redis()
-        state_key = f"triage_state:{result['session_id']}"
-        import json
-        await redis.set(state_key, json.dumps(result["_state"]), ex=3600)
+        store = TriageSessionStore(get_checkpointer_redis())
+        await store.save(
+            result["session_id"],
+            TriageState(**result["_state"]),
+            reply=result.get("follow_up_questions", [""])[0] if result.get("follow_up_questions") else "",
+        )
 
     triage_result = TriageResult(
         session_id=result["session_id"],
@@ -108,6 +110,10 @@ class FeedbackRequest(BaseModel):
     session_id: str = Field(..., description="分诊会话 ID")
     adopted: bool = Field(..., description="是否采纳诊断结论")
     comment: str | None = Field(None, description="反馈备注（如不采纳原因）")
+    correct_cause_code: str | None = Field(
+        None,
+        description="人工纠正时的正确根因编码（如 RC-EV-0012）；不采纳时传入，回写图谱",
+    )
 
 
 class FeedbackResult(BaseModel):
@@ -176,8 +182,12 @@ async def submit_feedback(req: FeedbackRequest):
             await weaken_graph_on_rejected(
                 confirmed_phenomena=confirmed,
                 primary_cause_code=cause_code,
+                correct_cause_code=req.correct_cause_code,
             )
-            logger.info(f"[TRIAGE-FB] 图谱弱化已触发 session={req.session_id}")
+            logger.info(
+                f"[TRIAGE-FB] 图谱弱化已触发 session={req.session_id} "
+                f"correct={req.correct_cause_code or '未提供'}"
+            )
         except Exception as e:
             logger.warning(f"[TRIAGE-FB] 图谱弱化失败: {e}")
 

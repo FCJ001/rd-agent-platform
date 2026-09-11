@@ -31,7 +31,7 @@ class TriageAgent:
         raw_input: str,
         session_id: str | None = None,
         issue_id: int | None = None,
-        existing_state: dict | None = None,
+        existing_state: TriageState | dict | None = None,
     ) -> dict:
         """
         执行一轮分诊诊断。
@@ -40,7 +40,8 @@ class TriageAgent:
             raw_input: 故障描述
             session_id: 会话 ID（新会话自动生成）
             issue_id: 关联问题单 ID
-            existing_state: 上一轮 TriageState 的序列化 dict（多轮时由调用方传入）
+            existing_state: 上一轮的 TriageState（对象或其序列化 dict，
+                多轮时由调用方经 TriageSessionStore 取出传入）
 
         Returns:
             dict with keys: session_id, status, round, normalized_phenomena,
@@ -52,7 +53,11 @@ class TriageAgent:
         # Deserialize existing state if provided
         prev_state = None
         if existing_state:
-            prev_state = TriageState(**existing_state)
+            prev_state = (
+                existing_state
+                if isinstance(existing_state, TriageState)
+                else TriageState(**existing_state)
+            )
 
         reply, result = await run_triage(
             user_message=raw_input,

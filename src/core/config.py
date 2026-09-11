@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_MODEL: str = "deepseek-chat"
 
+    # ---------------- 分诊收敛策略 ----------------
+    # 数据驱动收敛阈值（scripts/fit_convergence.py 的拟合产物）；
+    # 空串 = 用默认位置 eval/convergence_policy.json，文件不存在回退常数规则
+    CONVERGENCE_POLICY_PATH: str = ""
+
     # ---------------- 项目二（知识服务，步 7 才用到）----------------
     KNOWLEDGE_SVC_URL: str = "http://localhost:8001"
 

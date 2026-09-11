@@ -26,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.infra.db import AsyncSessionLocal
+from src.utils.mask import apply_mask
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ async def upsert_issue(db: AsyncSession, data: dict) -> str:
         "dtc_snapshot", "reporter_id", "owner_domain_id", "external_ref",
     }
     filtered = {k: v for k, v in data.items() if k in ALLOWED}
+    # 入库前字段脱敏：vin 只留后 6 位（见 AlmIssue.vin 注释），原始 VIN 不落库
+    filtered = apply_mask(filtered, "aftersales")
     filtered.setdefault("updated_at", datetime.utcnow())
 
     columns = list(filtered.keys())
@@ -82,7 +85,48 @@ async def upsert_issue(db: AsyncSession, data: dict) -> str:
     # 从 affected rows 无法精确判断是 insert 还是 update，
     # 简单区分：affected 1 代表有变化
     action = "upserted" if result.rowcount else "unchanged"
+
+    if action == "upserted":
+        # ★ 去重向量索引同步更新（fire-and-forget，失败只记日志不影响同步）
+        _schedule_dedup_index(filtered.get("issue_no", ""))
+
     return action
+
+
+def _schedule_dedup_index(issue_no: str) -> None:
+    """把问题单向量写入 Milvus 去重索引（后台任务）。
+
+    刻意不复用调用方的 session —— AsyncSession 不允许并发使用，
+    后台任务独立开短会话。索引滞后由 scripts/backfill_dedup_index.py 兜底。"""
+    import asyncio
+
+    async def _index():
+        try:
+            from src.infra.db import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as session:
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT id, issue_no, business_line, title, description "
+                            "FROM alm_issues WHERE issue_no = :issue_no"
+                        ),
+                        {"issue_no": issue_no},
+                    )
+                ).mappings().first()
+            if not row:
+                return
+            from src.agents.dedup import vector_index
+
+            await asyncio.to_thread(vector_index.upsert_issues, [dict(row)])
+        except Exception as e:
+            logger.warning(f"[SYNC] 去重索引更新失败 issue_no={issue_no}: {e}")
+
+    try:
+        asyncio.get_running_loop().create_task(_index())
+    except RuntimeError:
+        # 无事件循环（脚本/同步上下文）→ 同步执行
+        asyncio.run(_index())
 
 
 async def sync_issues_batch(

@@ -31,6 +31,7 @@ from src.core.base_schema import ResponseSchema
 from src.core.exceptions import BizException
 from src.core.logger import logger
 from src.infra.db import get_db
+from src.utils.mask import apply_mask
 
 router = APIRouter(prefix="/api/v1/webhooks", tags=["平台事件"])
 
@@ -124,7 +125,8 @@ async def consume_alm_event(
     # ---- ② 写入镜像表 ----
     table = dispatch["table"]
     key_col = dispatch["key_column"]
-    data = event.data
+    # 入库前字段脱敏（vin 只留后 6 位）；非问题单实体没有敏感字段，等于无操作
+    data = apply_mask(event.data, "aftersales")
 
     try:
         # 模拟场景：data 里可能只有部分字段。

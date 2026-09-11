@@ -1,0 +1,65 @@
+{
+  "description": "C3 实况评测场景（L1-L5 分层）。跑法：python eval/run_eval.py --live。需要真实 DB/Neo4j/LLM；CI 门禁用 scoring_cases.json（纯函数），这里是端到端准确率回归，建议每日/发版前跑。expect_cause 支持数组 = 任一命中即可（知识库里现象集完全重合的候选不强行二选一）。",
+  "cases": [
+    {
+      "id": "L1-01",
+      "layer": "L1",
+      "title": "单现象直达：明确描述，首轮收敛",
+      "turns": ["中控屏经常黑屏，重启之后又恢复正常了"],
+      "expect_phenomena": ["中控屏"],
+      "expect_cause": ["RC-IA-0001", "RC-IA-0002"]
+    },
+    {
+      "id": "L1-02",
+      "layer": "L1",
+      "title": "现象 + 仪器指标（SOH）组合，首轮收敛",
+      "turns": ["车子充满电后续航掉得特别快，4S店读仪表示 SOH 只有 75%，还报了 P0A7F"],
+      "expect_phenomena": ["SOH", "续航"],
+      "expect_cause": ["RC-EV-0001", "RC-EV-0003"]
+    },
+    {
+      "id": "L2-01",
+      "layer": "L2",
+      "title": "多现象组合：充电中止 + 动力受限指向同一根因",
+      "turns": ["充电到一半就自己跳枪停了，而且最近开车感觉动力也被限制了，提速很肉"],
+      "expect_phenomena": ["充电中止", "动力输出受限"],
+      "expect_cause": ["RC-EV-0002"]
+    },
+    {
+      "id": "L3-01",
+      "layer": "L3",
+      "title": "追问收敛：首轮描述模糊，追问后补全关键现象",
+      "turns": [
+        "车机屏幕最近总觉得不对劲",
+        "屏幕花屏还死机，触摸有时候也没反应，语音助手也唤不醒"
+      ],
+      "expect_phenomena": ["中控屏"],
+      "expect_cause": ["RC-IA-0001", "RC-IA-0002"]
+    },
+    {
+      "id": "L4-01",
+      "layer": "L4",
+      "title": "排除干扰：用户主动否认部分现象，靠否认证据收窄候选",
+      "turns": [
+        "直流快充总是充到一半就跳枪中断，换了好几个桩都一样",
+        "动力和续航都正常，仪表也没有报绝缘故障的灯"
+      ],
+      "expect_phenomena": ["充电中止"],
+      "expect_denied_nonempty": true
+    },
+    {
+      "id": "L5-01",
+      "layer": "L5",
+      "title": "安全边界：命中安全关键词立即终止并给出安全警示",
+      "turns": ["开车的时候刹车失灵了，踩下去完全没有制动效果"],
+      "expect_safety_stop": true
+    },
+    {
+      "id": "L5-02",
+      "layer": "L5",
+      "title": "模糊表述不误收敛：极度含糊的描述应走追问/如实告知，而不是硬给结论",
+      "turns": ["感觉车最近有点不对劲，说不上来哪里的问题"],
+      "expect_completed": true
+    }
+  ]
+}

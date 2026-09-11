@@ -1,0 +1,178 @@
+{
+  "description": "C3 评分级评测案例 —— CI 回归门禁。纯函数可跑（不依赖 DB/Neo4j/LLM），锁住 confidence.py 证据分级 + Noisy-OR 的行为契约。每个案例给合成候选根因和证据输入，断言排序 / 置信区间 / 收敛判定。",
+  "cases": [
+    {
+      "id": "S1",
+      "layer": "L1",
+      "title": "仪器级 DTC + 明确现象 → 高置信收敛",
+      "candidates": [
+        {"code": "RC-A", "name": "网关通信故障", "base_confidence": 1.0,
+         "matched_phenomena": ["中控屏显示异常"], "all_phenomena": ["中控屏显示异常"],
+         "phenomena_weight": {"中控屏显示异常": 1.0}, "dtc_matched": ["U0155"]}
+      ],
+      "dtc_codes": ["U0155"],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"中控屏显示异常": "reported"},
+      "dtc_evidence": {"U0155": "instrument"},
+      "expect": {"top_code": "RC-A", "confidence_min": {"RC-A": 0.9},
+                 "convergence": {"round": 0, "should_conclude": true}}
+    },
+    {
+      "id": "S2a",
+      "layer": "L5",
+      "title": "模糊表述（好像是）单独不足以收敛 —— 与 S2b 对照锁住证据分级差",
+      "candidates": [
+        {"code": "RC-B", "name": "座舱SoC内存泄漏", "base_confidence": 1.0,
+         "matched_phenomena": ["中控屏显示异常"], "all_phenomena": ["中控屏显示异常"],
+         "phenomena_weight": {"中控屏显示异常": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"中控屏显示异常": "hedged"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-B", "confidence_max": {"RC-B": 0.6},
+                 "convergence": {"round": 0, "should_conclude": false}}
+    },
+    {
+      "id": "S2b",
+      "layer": "L1",
+      "title": "同一现象改为明确表述 → 越过收敛线（S2a 的对照组）",
+      "candidates": [
+        {"code": "RC-B", "name": "座舱SoC内存泄漏", "base_confidence": 1.0,
+         "matched_phenomena": ["中控屏显示异常"], "all_phenomena": ["中控屏显示异常"],
+         "phenomena_weight": {"中控屏显示异常": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"中控屏显示异常": "reported"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-B", "confidence_min": {"RC-B": 0.65},
+                 "convergence": {"round": 0, "should_conclude": true}}
+    },
+    {
+      "id": "S3",
+      "layer": "L4",
+      "title": "核心（独有）现象被否认 → 该候选大幅降权跌出结论区",
+      "candidates": [
+        {"code": "RC-A", "name": "屏幕排线松动", "base_confidence": 1.0,
+         "matched_phenomena": ["屏闪烁"], "all_phenomena": ["屏闪烁"],
+         "phenomena_weight": {"屏闪烁": 1.0}, "dtc_matched": []},
+        {"code": "RC-B", "name": "功放模块故障", "base_confidence": 0.5,
+         "matched_phenomena": ["屏闪烁"], "all_phenomena": ["喇叭无声", "屏闪烁"],
+         "phenomena_weight": {"屏闪烁": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": ["喇叭无声"],
+      "phenomena_evidence": {"屏闪烁": "reported"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-A", "confidence_max": {"RC-B": 0.3}}
+    },
+    {
+      "id": "S4",
+      "layer": "L2",
+      "title": "Noisy-OR 单调性：命中两个现象的候选压过只命中一个的，覆盖率阻尼同时生效",
+      "candidates": [
+        {"code": "RC-C", "name": "电机轴承磨损", "base_confidence": 1.0,
+         "matched_phenomena": ["加速抖动", "异响"], "all_phenomena": ["加速抖动", "异响"],
+         "phenomena_weight": {"加速抖动": 1.0, "异响": 1.0}, "dtc_matched": []},
+        {"code": "RC-D", "name": "半轴不平衡", "base_confidence": 0.3333,
+         "matched_phenomena": ["异响"], "all_phenomena": ["加速抖动", "异响", "空调不冷"],
+         "phenomena_weight": {"异响": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"加速抖动": "reported", "异响": "reported"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-C", "order": ["RC-C", "RC-D"]}
+    },
+    {
+      "id": "S5",
+      "layer": "L5",
+      "title": "图谱权重被反馈衰减（×0.6 若干轮后 0.3）→ 证据同步变弱，不能再靠它收敛",
+      "candidates": [
+        {"code": "RC-F", "name": "满油门标定缺陷", "base_confidence": 1.0,
+         "matched_phenomena": ["加速无力"], "all_phenomena": ["加速无力"],
+         "phenomena_weight": {"加速无力": 1.0}, "dtc_matched": []},
+        {"code": "RC-E", "name": "被否决衰减过的关联", "base_confidence": 1.0,
+         "matched_phenomena": ["加速无力"], "all_phenomena": ["加速无力"],
+         "phenomena_weight": {"加速无力": 0.3}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"加速无力": "reported"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-F", "order": ["RC-F", "RC-E"]}
+    },
+    {
+      "id": "S6",
+      "layer": "L3",
+      "title": "追问确认级证据（confirmed 0.55）介于模糊与自发之间，本轮不收敛、继续追问",
+      "candidates": [
+        {"code": "RC-G", "name": "无线充电模块故障", "base_confidence": 1.0,
+         "matched_phenomena": ["充电中止"], "all_phenomena": ["充电中止"],
+         "phenomena_weight": {"充电中止": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"充电中止": "confirmed"},
+      "dtc_evidence": {},
+      "expect": {"top_code": "RC-G", "confidence_min": {"RC-G": 0.5},
+                 "confidence_max": {"RC-G": 0.6},
+                 "convergence": {"round": 0, "should_conclude": false}}
+    },
+    {
+      "id": "S7",
+      "layer": "L4",
+      "title": "非核心（共享）现象被否认 → 温和降权（对照 S7b 无否认，锁住 ×0.7）",
+      "candidates": [
+        {"code": "RC-I", "name": "车载充电机故障", "base_confidence": 0.5,
+         "matched_phenomena": ["充电跳闸"], "all_phenomena": ["充电跳闸", "续航下降"],
+         "phenomena_weight": {"充电跳闸": 1.0}, "dtc_matched": []},
+        {"code": "RC-J", "name": "充电桩协议不兼容", "base_confidence": 0.5,
+         "matched_phenomena": ["充电慢"], "all_phenomena": ["充电慢", "续航下降"],
+         "phenomena_weight": {"充电慢": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": ["续航下降"],
+      "phenomena_evidence": {"充电跳闸": "reported", "充电慢": "reported"},
+      "dtc_evidence": {},
+      "expect": {"confidence_max": {"RC-I": 0.45, "RC-J": 0.45},
+                 "confidence_min": {"RC-I": 0.35, "RC-J": 0.35}}
+    },
+    {
+      "id": "S7b",
+      "layer": "L4",
+      "title": "S7 的对照组：同样的候选、无否认 → 落在 0.5-0.6 区间（证明否认确实乘了 0.7）",
+      "candidates": [
+        {"code": "RC-I", "name": "车载充电机故障", "base_confidence": 0.5,
+         "matched_phenomena": ["充电跳闸"], "all_phenomena": ["充电跳闸", "续航下降"],
+         "phenomena_weight": {"充电跳闸": 1.0}, "dtc_matched": []},
+        {"code": "RC-J", "name": "充电桩协议不兼容", "base_confidence": 0.5,
+         "matched_phenomena": ["充电慢"], "all_phenomena": ["充电慢", "续航下降"],
+         "phenomena_weight": {"充电慢": 1.0}, "dtc_matched": []}
+      ],
+      "dtc_codes": [],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"充电跳闸": "reported", "充电慢": "reported"},
+      "dtc_evidence": {},
+      "expect": {"confidence_max": {"RC-I": 0.6, "RC-J": 0.6},
+                 "confidence_min": {"RC-I": 0.5, "RC-J": 0.5}}
+    },
+    {
+      "id": "S8",
+      "layer": "L2",
+      "title": "用户口述 DTC（reported 0.60）弱于仪器快照（S1 的 0.90），但仍是有效佐证",
+      "candidates": [
+        {"code": "RC-K", "name": "CAN 总线负载过高", "base_confidence": 1.0,
+         "matched_phenomena": ["系统响应迟滞"], "all_phenomena": ["系统响应迟滞"],
+         "phenomena_weight": {"系统响应迟滞": 1.0}, "dtc_matched": ["U0073"]}
+      ],
+      "dtc_codes": ["U0073"],
+      "denied_phenomena": [],
+      "phenomena_evidence": {"系统响应迟滞": "reported"},
+      "dtc_evidence": {"U0073": "reported"},
+      "expect": {"top_code": "RC-K", "confidence_min": {"RC-K": 0.8},
+                 "confidence_max": {"RC-K": 0.95}}
+    }
+  ]
+}
