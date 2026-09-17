@@ -15,18 +15,24 @@
 import pytest
 from httpx import AsyncClient
 
+# 依赖真实运行的服务（docker compose 全套 + 种子数据），CI 默认跳过：
+# pytest -m "not integration"；本地跑全套时用 pytest -m integration
+pytestmark = [pytest.mark.integration]
+
 # 走已运行的 uvicorn，不用 ASGITransport。
 # ASGITransport 在 pytest-asyncio 下会创建独立 event loop，
 # 而 SQLAlchemy engine 是模块导入时在主进程 event loop 上建的 —— 必炸。
 BASE = "http://localhost:8000"
 
 # (user_id, username, role, 期望行数)
+# ★ 2026-09 数据扩容后重算：24 → 164 行（追加 ISS-2026-* 确定性数据，
+#   热管理/整车控制两域刻意留空以保留下方空域反例）
 ROLE_CASES = [
-    (1, "eng01", "engineer", 10),   # 电池系统域
-    (10, "biz_ev", "business", 12),  # ev 线
-    (12, "service01", "aftersales", 5),   # closed + verified
-    (13, "cust01", "customer", 3),   # 只有自己上报的
-    (14, "admin", "admin", 24),  # 全部
+    (1, "eng01", "engineer", 30),   # 电池系统域
+    (10, "biz_ev", "business", 72),  # ev 线
+    (12, "service01", "aftersales", 61),   # closed + verified
+    (13, "cust01", "customer", 31),   # 只有自己上报的
+    (14, "admin", "admin", 164),  # 全部
 ]
 
 # 反例：这两个域没有问题单，工程师应该什么都看不到

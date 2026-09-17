@@ -36,8 +36,15 @@ ROLE_MASK_RULES = {
 
 
 def apply_mask(data: dict, role: str) -> dict:
-    """按角色对敏感字段打码，原地修改并返回。"""
-    rules = ROLE_MASK_RULES.get(role, {})
+    """按角色对敏感字段打码，原地修改并返回。
+
+    ★ fail-closed：角色名不认识时按最严格的 customer 规则处理。
+      以前是未知角色直接跳过脱敏（fail-open），而 role 一旦来自
+      客户端可控输入，等于给了整体绕过脱敏的开关。
+    """
+    rules = ROLE_MASK_RULES.get(role)
+    if rules is None:
+        rules = ROLE_MASK_RULES["customer"]
     if not rules:
         return data
     for key in list(data.keys()):
@@ -51,15 +58,17 @@ def redact_sensitive_fields(data: dict, role: str) -> dict:
     return apply_mask(dict(data), role)
 
 
-# 自由文本中的敏感模式：VIN（17 位，排除 I/O/Q）和大陆手机号
+# 自由文本中的敏感模式：VIN（17 位，排除 I/O/Q，大小写均可）和大陆手机号
 # 注意不能用 \b 定界 —— 中文汉字属于 \w，"号LSV..."之间没有词边界，
 # 中文语境下 \b 永远匹配不上；用显式字母数字 lookaround 防止截断更长串
-_VIN_RE = re.compile(r"(?<![A-Za-z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Za-z0-9])")
-_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_VIN_RE = re.compile(r"(?<![A-Za-z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Za-z0-9])", re.IGNORECASE)
+# +86 / 86 前缀可选；(?<!\d) 保证不是更长数字串的一段
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 
 
 def mask_free_text(text: str | None) -> str | None:
-    """对自由文本里的 VIN / 手机号打码。
+    """对自由文本里的 VIN / 手机号 / 邮箱打码。
 
     用户消息（chat 输入）在进 LLM / 入库前过这里，兜住
     「结构化字段已脱敏、但原文里还带着完整 VIN」的漏网情况。
@@ -67,5 +76,13 @@ def mask_free_text(text: str | None) -> str | None:
     if not text:
         return text
     text = _VIN_RE.sub(lambda m: mask_vin(m.group(0)), text)
-    text = _PHONE_RE.sub(lambda m: mask_phone(m.group(0)), text)
+
+    def _mask_phone_match(m):
+        # 命中可能是 "+8613812345678" 这类带前缀形式：
+        # 前缀原样保留，只对最后 11 位手机号本体打码
+        raw = m.group(0)
+        return raw[:-11] + mask_phone(raw[-11:])
+
+    text = _PHONE_RE.sub(_mask_phone_match, text)
+    text = _EMAIL_RE.sub(lambda m: mask_email(m.group(0)), text)
     return text

@@ -10,6 +10,17 @@ from src.core.logger import logger
 settings = get_settings()
 
 
+# 开发期占位域名。Java 平台接入后把 PLATFORM_ALM_API_URL 配成真实地址即可
+_PLACEHOLDER_HOST = "alm.internal"
+_SEVERITIES = {"blocker", "critical", "normal", "minor"}
+# 业务线取值来自 settings.BUSINESS_LINES（见 config.py 注释），不再写死在代码里
+
+
+def _platform_ready() -> bool:
+    """Java 平台 API 是否已真实配置（不是占位符）。"""
+    return bool(settings.PLATFORM_ALM_API_URL) and _PLACEHOLDER_HOST not in settings.PLATFORM_ALM_API_URL
+
+
 @tool
 async def call_create_issue(
     title: str,
@@ -26,18 +37,42 @@ async def call_create_issue(
         title: 问题标题（简短描述）
         description: 问题描述（故障现象、DTC码等）
         severity: 严重度（blocker/critical/normal/minor）
-        business_line: 业务线（ev=电动化 / ia=智能化）
+        business_line: 业务线。★ 仅作兜底：请求上下文里有用户所属业务线时
+            以它为准，LLM 传的值只在上下文取不到时使用（作用域不能让模型决定）
     """
+    # 参数先校验：LLM 传参不可信，脏数据不能进平台
+    if severity not in _SEVERITIES:
+        return f"创建失败：severity 取值不合法（{severity!r}），只允许 {'/'.join(sorted(_SEVERITIES))}。"
+
     ctx = runtime.context
+    # 作用域优先级：请求上下文（用户所属业务线）> LLM 入参。
+    # 允许的取值来自配置，新项目上线改 BUSINESS_LINES 即可
+    allowed = settings.business_lines
+    scope = ctx.business_line or business_line
+    if scope not in allowed:
+        return (
+            f"创建失败：business_line 取值不合法（{scope!r}），"
+            f"只允许 {'/'.join(sorted(allowed))}。"
+        )
+
     payload = {
         "title": title,
         "description": description,
         "severity": severity,
-        "business_line": business_line,
+        "business_line": scope,
         "source": ctx.role,
         "reporter_id": ctx.user_id,
         "owner_domain_id": ctx.owner_domain_id,
     }
+
+    if not _platform_ready():
+        # ★ 诚实失败：开发期平台没接入，绝不能让用户以为建单成功
+        logger.warning(f"[JAVA-API] 平台未接入，未真正建单 user={ctx.user_id} title={title!r}")
+        return (
+            "ALM 平台接口尚未接入（开发环境），本次**没有**真正创建问题单。\n"
+            f"待提交内容：{title} | 严重度 {severity} | 业务线 {scope}\n"
+            "请到 ALM 平台手动创建，或等平台接入后再试。"
+        )
 
     logger.info(
         f"[JAVA-API] POST {settings.PLATFORM_ALM_API_URL}/issues "
@@ -72,7 +107,7 @@ async def call_link_issue(
     )
 
     return (
-        f"已关联问题单 {issue_no}。\n"
+        f"已在本会话关联问题单 {issue_no}（仅本地关联，未调用平台接口）。\n"
         f"查看详情：{settings.PLATFORM_ALM_URL}/issues/{issue_no}\n"
         f"接下来可以对此问题进行诊断分析。"
     )
@@ -102,6 +137,14 @@ async def call_close_issue(
         "status": "verified",
         "operator_id": ctx.user_id,
     }
+
+    if not _platform_ready():
+        logger.warning(f"[JAVA-API] 平台未接入，未真正提交结案 issue_no={issue_no}")
+        return (
+            "ALM 平台接口尚未接入（开发环境），本次**没有**真正提交结案建议。\n"
+            f"待提交内容：{issue_no} 结案，根因 {root_cause}\n"
+            "请到 ALM 平台手动走结案流程。"
+        )
 
     logger.info(
         f"[JAVA-API] POST {settings.PLATFORM_ALM_API_URL}/issues/{issue_no}/close "

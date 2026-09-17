@@ -10,6 +10,7 @@ from src.agents.report.standards import (
 )
 from src.agents.report.prompts import REPORT_PARSE_PROMPT, INTERPRET_PROMPT
 from src.core.config import get_settings
+from src.core.logger import logger
 
 settings = get_settings()
 
@@ -76,8 +77,17 @@ async def analyze_report(report_text: str, report_type: str = "DTC扫描") -> st
 
     for m in metrics:
         key = m.get("key", "")
-        value = float(m.get("value", 0))
         unit = m.get("unit", "")
+
+        # ★ LLM 返回的数值不可信：可能是 "N/A"、"约0.09V"、None、""。
+        #   直接 float() 会抛 ValueError，把整份报告的解读打断 —— 而报告里
+        #   只要有一个指标抽成这样，用户拿到的是 500 而不是「其余指标正常」。
+        #   取值失败就跳过该条并留痕，其余指标照常判定。
+        try:
+            value = float(m.get("value"))
+        except (TypeError, ValueError):
+            logger.warning(f"[REPORT] 指标取值非数字，跳过 key={key!r} value={m.get('value')!r}")
+            continue
 
         is_abnormal, severity = judge(key, value)
         standard = find_standard(key)

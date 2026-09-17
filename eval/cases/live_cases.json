@@ -1,65 +1,1245 @@
 {
-  "description": "C3 实况评测场景（L1-L5 分层）。跑法：python eval/run_eval.py --live。需要真实 DB/Neo4j/LLM；CI 门禁用 scoring_cases.json（纯函数），这里是端到端准确率回归，建议每日/发版前跑。expect_cause 支持数组 = 任一命中即可（知识库里现象集完全重合的候选不强行二选一）。",
-  "cases": [
-    {
-      "id": "L1-01",
-      "layer": "L1",
-      "title": "单现象直达：明确描述，首轮收敛",
-      "turns": ["中控屏经常黑屏，重启之后又恢复正常了"],
-      "expect_phenomena": ["中控屏"],
-      "expect_cause": ["RC-IA-0001", "RC-IA-0002"]
-    },
-    {
-      "id": "L1-02",
-      "layer": "L1",
-      "title": "现象 + 仪器指标（SOH）组合，首轮收敛",
-      "turns": ["车子充满电后续航掉得特别快，4S店读仪表示 SOH 只有 75%，还报了 P0A7F"],
-      "expect_phenomena": ["SOH", "续航"],
-      "expect_cause": ["RC-EV-0001", "RC-EV-0003"]
-    },
-    {
-      "id": "L2-01",
-      "layer": "L2",
-      "title": "多现象组合：充电中止 + 动力受限指向同一根因",
-      "turns": ["充电到一半就自己跳枪停了，而且最近开车感觉动力也被限制了，提速很肉"],
-      "expect_phenomena": ["充电中止", "动力输出受限"],
-      "expect_cause": ["RC-EV-0002"]
-    },
-    {
-      "id": "L3-01",
-      "layer": "L3",
-      "title": "追问收敛：首轮描述模糊，追问后补全关键现象",
-      "turns": [
-        "车机屏幕最近总觉得不对劲",
-        "屏幕花屏还死机，触摸有时候也没反应，语音助手也唤不醒"
-      ],
-      "expect_phenomena": ["中控屏"],
-      "expect_cause": ["RC-IA-0001", "RC-IA-0002"]
-    },
-    {
-      "id": "L4-01",
-      "layer": "L4",
-      "title": "排除干扰：用户主动否认部分现象，靠否认证据收窄候选",
-      "turns": [
-        "直流快充总是充到一半就跳枪中断，换了好几个桩都一样",
-        "动力和续航都正常，仪表也没有报绝缘故障的灯"
-      ],
-      "expect_phenomena": ["充电中止"],
-      "expect_denied_nonempty": true
-    },
-    {
-      "id": "L5-01",
-      "layer": "L5",
-      "title": "安全边界：命中安全关键词立即终止并给出安全警示",
-      "turns": ["开车的时候刹车失灵了，踩下去完全没有制动效果"],
-      "expect_safety_stop": true
-    },
-    {
-      "id": "L5-02",
-      "layer": "L5",
-      "title": "模糊表述不误收敛：极度含糊的描述应走追问/如实告知，而不是硬给结论",
-      "turns": ["感觉车最近有点不对劲，说不上来哪里的问题"],
-      "expect_completed": true
-    }
-  ]
+ "description": "L1-L5 端到端实况场景：手工 20 + 图谱批量生成 15（断言由真实图谱+评分代码仿真标定）",
+ "cases": [
+  {
+   "id": "L1-01",
+   "layer": "L1",
+   "title": "单现象定位：区分度不足时进入追问而非硬收敛",
+   "turns": [
+    "中控屏经常黑屏，重启之后又恢复正常了"
+   ],
+   "expect_phenomena": [
+    "中控屏"
+   ],
+   "expect_converged": false,
+   "expect_cause": [
+    "RC-IA-0065"
+   ]
+  },
+  {
+   "id": "L1-02",
+   "layer": "L1",
+   "title": "现象+仪器指标（SOH/DTC）组合，首轮收敛",
+   "turns": [
+    "车子充满电后续航掉得特别快，4S店读仪表示 SOH 只有 75%，还报了 P0A7F"
+   ],
+   "expect_phenomena": [
+    "SOH",
+    "续航"
+   ],
+   "expect_cause": [
+    "RC-EV-0001"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L1-03",
+   "layer": "L1",
+   "title": "座舱三现象组合，首轮收敛",
+   "turns": [
+    "中控屏黑屏花屏，语音助手唤不醒，系统操作也很卡顿"
+   ],
+   "expect_phenomena": [
+    "中控屏",
+    "语音",
+    "响应"
+   ],
+   "expect_cause": [
+    "RC-IA-0001",
+    "RC-IA-0002"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L1-04",
+   "layer": "L1",
+   "title": "充电口过热+充电慢，首轮收敛",
+   "turns": [
+    "充电口摸着发烫，充电速度也比之前慢很多"
+   ],
+   "expect_phenomena": [
+    "充电口",
+    "充电速度"
+   ],
+   "expect_cause": [
+    "RC-EV-0054",
+    "RC-EV-0022"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "L1-05",
+   "layer": "L1",
+   "title": "机械异响组合（啸叫+抖动），首轮收敛",
+   "turns": [
+    "滑行的时候底盘有啸叫声，急加速车身还抖动"
+   ],
+   "expect_phenomena": [
+    "啸叫",
+    "抖动"
+   ],
+   "expect_cause": [
+    "RC-EV-0012"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L2-01",
+   "layer": "L2",
+   "title": "多现象组合指向同一根因（电芯压差），补全后收敛",
+   "turns": [
+    "充电到一半就自己跳枪停了，而且最近开车感觉动力也被限制了，提速很肉",
+    "仪表还显示电池 SOH 偏低"
+   ],
+   "expect_phenomena": [
+    "充电中止",
+    "动力",
+    "SOH"
+   ],
+   "expect_cause": [
+    "RC-EV-0002"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L2-02",
+   "layer": "L2",
+   "title": "绝缘报警+充电中止 → 电池包绝缘故障",
+   "turns": [
+    "仪表报绝缘故障灯亮，快充到一半就跳枪停了"
+   ],
+   "expect_phenomena": [
+    "绝缘",
+    "充电中止"
+   ],
+   "expect_cause": [
+    "RC-EV-0004"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L2-03",
+   "layer": "L2",
+   "title": "加速无力+功率限制 → 电机控制器 IGBT 过热",
+   "turns": [
+    "提速没劲，仪表还出现功率限制的提示"
+   ],
+   "expect_phenomena": [
+    "加速无力",
+    "仪表功率"
+   ],
+   "expect_cause": [
+    "RC-EV-0023",
+    "RC-EV-0011"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "L2-04",
+   "layer": "L2",
+   "title": "远程控车+登录失败 → 云端认证失败",
+   "turns": [
+    "手机 App 远程控车一直超时，账号也登录失败"
+   ],
+   "expect_phenomena": [
+    "远程控车",
+    "账号登录"
+   ],
+   "expect_cause": [
+    "RC-IA-0071"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "L3-01",
+   "layer": "L3",
+   "title": "首轮模糊，追问后补全关键现象收敛",
+   "turns": [
+    "车机屏幕最近总觉得不对劲",
+    "屏幕花屏还死机，触摸有时候也没反应，语音助手也唤不醒"
+   ],
+   "expect_phenomena": [
+    "中控屏",
+    "语音"
+   ],
+   "expect_cause": [
+    "RC-IA-0001",
+    "RC-IA-0002"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L3-02",
+   "layer": "L3",
+   "title": "无法上高压追问出充电中止，候选收窄",
+   "turns": [
+    "车提示无法上高压，不知道什么问题",
+    "快充也充不进去，充到一半就自己停了"
+   ],
+   "expect_phenomena": [
+    "无法上高压",
+    "充电中止"
+   ],
+   "expect_cause": [
+    "RC-EV-0004"
+   ]
+  },
+  {
+   "id": "L3-03",
+   "layer": "L3",
+   "title": "续航衰减追问出 SOH，候选收窄到电芯衰减",
+   "turns": [
+    "最近续航掉得特别快",
+    "4S店检测说 SOH 只有 78%"
+   ],
+   "expect_phenomena": [
+    "续航",
+    "SOH"
+   ],
+   "expect_cause": [
+    "RC-EV-0001"
+   ]
+  },
+  {
+   "id": "L3-04",
+   "layer": "L3",
+   "title": "ACC 异常追问出 ADAS 受限提示，收敛",
+   "turns": [
+    "ACC 自适应巡航跟车距离忽远忽近",
+    "仪表还提示 ADAS 功能受限"
+   ],
+   "expect_phenomena": [
+    "ACC",
+    "ADAS"
+   ],
+   "expect_cause": [
+    "RC-IA-0056",
+    "RC-IA-0011"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L4-01",
+   "layer": "L4",
+   "title": "用户否认动力/续航/绝缘，收窄候选不误收敛",
+   "turns": [
+    "直流快充总是充到一半就跳枪中断，换了好几个桩都一样",
+    "动力和续航都正常，仪表也没有报绝缘故障的灯"
+   ],
+   "expect_phenomena": [
+    "充电中止"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_converged": false
+  },
+  {
+   "id": "L4-02",
+   "layer": "L4",
+   "title": "否认充电口过热 → 排除线缆/接口损坏，指向定子绕组",
+   "turns": [
+    "充电总是中途停止，充电速度也上不去",
+    "充电口不烫，应该不是接口的问题"
+   ],
+   "expect_phenomena": [
+    "充电中止",
+    "充电速度"
+   ],
+   "expect_cause": [
+    "RC-EV-0021"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_converged": false
+  },
+  {
+   "id": "L4-03",
+   "layer": "L4",
+   "title": "否认空调异常 → 排除 PTC/压缩机，指向 IGBT 过热",
+   "turns": [
+    "提速没劲",
+    "动力也感觉被限制了，但空调制冷是正常的"
+   ],
+   "expect_phenomena": [
+    "加速无力",
+    "动力"
+   ],
+   "expect_cause": [
+    "RC-EV-0033"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_converged": true
+  },
+  {
+   "id": "L4-04",
+   "layer": "L4",
+   "title": "否认登录失败 → 排除云端认证，指向 T-Box 掉网（否认提取待强化）",
+   "turns": [
+    "远程控车老是超时",
+    "语音助手也没反应，但账号登录是正常的"
+   ],
+   "expect_phenomena": [
+    "远程控车",
+    "语音"
+   ],
+   "expect_cause": [
+    "RC-IA-0076",
+    "RC-IA-0021"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "L5-01",
+   "layer": "L5",
+   "title": "安全边界：制动失灵关键词立即终止并警示",
+   "turns": [
+    "开车的时候刹车失灵了，踩下去完全没有制动效果"
+   ],
+   "expect_safety_stop": true
+  },
+  {
+   "id": "L5-02",
+   "layer": "L5",
+   "title": "模糊表述不误收敛：极度含糊应追问/如实告知",
+   "turns": [
+    "感觉车最近有点不对劲，说不上来哪里的问题"
+   ],
+   "expect_completed": true,
+   "expect_converged": false
+  },
+  {
+   "id": "L5-03",
+   "layer": "L5",
+   "title": "安全边界：突然加速/油门失控关键词触发终止",
+   "turns": [
+    "开车时油门突然加速踩到底，完全刹不住，太吓人了"
+   ],
+   "expect_safety_stop": true
+  },
+  {
+   "id": "GEN-001",
+   "layer": "L2",
+   "title": "批量：动力电池电芯容量衰减——典型双现象组合，首轮收敛",
+   "turns": [
+    "续航异常衰减，而且SOH数值偏低"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_cause": [
+    "RC-EV-0001"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-002",
+   "layer": "L2",
+   "title": "批量：电池单体压差过大——典型双现象组合，首轮收敛",
+   "turns": [
+    "SOH数值偏低，而且动力输出受限"
+   ],
+   "expect_phenomena": [
+    "SO"
+   ],
+   "expect_cause": [
+    "RC-EV-0002"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-003",
+   "layer": "L2",
+   "title": "批量：电池包绝缘故障——典型双现象组合，首轮收敛",
+   "turns": [
+    "充电中止，而且绝缘报警灯亮"
+   ],
+   "expect_phenomena": [
+    "充电"
+   ],
+   "expect_cause": [
+    "RC-EV-0004"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-004",
+   "layer": "L2",
+   "title": "批量：电机转子不平衡——典型双现象组合，首轮收敛",
+   "turns": [
+    "驱动系统异响，而且加速抖动"
+   ],
+   "expect_phenomena": [
+    "驱动"
+   ],
+   "expect_cause": [
+    "RC-EV-0028"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-005",
+   "layer": "L2",
+   "title": "批量：减速器油温过高——典型双现象组合，首轮收敛",
+   "turns": [
+    "加速无力，而且滑行啸叫声"
+   ],
+   "expect_phenomena": [
+    "加速"
+   ],
+   "expect_cause": [
+    "RC-EV-0030"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-006",
+   "layer": "L2",
+   "title": "批量：电机定子绕组短路——典型双现象组合，首轮收敛",
+   "turns": [
+    "动力输出受限，而且加速无力"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_cause": [
+    "RC-EV-0033"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-007",
+   "layer": "L2",
+   "title": "批量：电驱系统过热保护触发——典型双现象组合，首轮收敛",
+   "turns": [
+    "动力输出受限，而且仪表功率限制提示"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_cause": [
+    "RC-EV-0034"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-008",
+   "layer": "L2",
+   "title": "批量：能量管理系统通信故障——典型双现象组合，首轮收敛",
+   "turns": [
+    "满电续航显示下降，而且SOC跳变"
+   ],
+   "expect_phenomena": [
+    "满电"
+   ],
+   "expect_cause": [
+    "RC-EV-0046"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-009",
+   "layer": "L2",
+   "title": "批量：能量回收阈值设定不当——典型双现象组合，首轮收敛",
+   "turns": [
+    "续航异常衰减，而且滑行啸叫声"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_cause": [
+    "RC-EV-0051"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-010",
+   "layer": "L2",
+   "title": "批量：车联网云端推送延迟——典型双现象组合，首轮收敛",
+   "turns": [
+    "系统响应迟滞，而且远程控车超时"
+   ],
+   "expect_phenomena": [
+    "系统"
+   ],
+   "expect_cause": [
+    "RC-IA-0022"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-011",
+   "layer": "L2",
+   "title": "批量：前视摄像头脏污影响感知精度——典型双现象组合，首轮收敛",
+   "turns": [
+    "ADAS功能受限提示，而且ACC跟车异常"
+   ],
+   "expect_phenomena": [
+    "AD"
+   ],
+   "expect_cause": [
+    "RC-IA-0056"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-012",
+   "layer": "L2",
+   "title": "批量：盲点监测警告失效——典型双现象组合，首轮收敛",
+   "turns": [
+    "中控屏显示异常，而且ADAS功能受限提示"
+   ],
+   "expect_phenomena": [
+    "中控"
+   ],
+   "expect_cause": [
+    "RC-IA-0060"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-013",
+   "layer": "L2",
+   "title": "批量：交通标志识别错误——典型双现象组合，首轮收敛",
+   "turns": [
+    "系统响应迟滞，而且ADAS功能受限提示"
+   ],
+   "expect_phenomena": [
+    "系统"
+   ],
+   "expect_cause": [
+    "RC-IA-0061"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-014",
+   "layer": "L2",
+   "title": "批量：行人/障碍物检测误报频繁——典型双现象组合，首轮收敛",
+   "turns": [
+    "ADAS功能受限提示，而且制动异响"
+   ],
+   "expect_phenomena": [
+    "AD"
+   ],
+   "expect_cause": [
+    "RC-IA-0062"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-015",
+   "layer": "L2",
+   "title": "批量：驾驶员注意力监测系统失灵——典型双现象组合，首轮收敛",
+   "turns": [
+    "语音交互失效，而且ADAS功能受限提示"
+   ],
+   "expect_phenomena": [
+    "语音"
+   ],
+   "expect_cause": [
+    "RC-IA-0063"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-016",
+   "layer": "L2",
+   "title": "批量：仪表盘数据同步延迟——典型双现象组合，首轮收敛",
+   "turns": [
+    "仪表功率限制提示，而且系统响应迟滞"
+   ],
+   "expect_phenomena": [
+    "仪表"
+   ],
+   "expect_cause": [
+    "RC-IA-0066"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-017",
+   "layer": "L2",
+   "title": "批量：蓝牙连接不稳定——典型双现象组合，首轮收敛",
+   "turns": [
+    "系统响应迟滞，而且语音交互失效"
+   ],
+   "expect_phenomena": [
+    "系统"
+   ],
+   "expect_cause": [
+    "RC-IA-0068"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-018",
+   "layer": "L2",
+   "title": "批量：空调控制逻辑错误——典型双现象组合，首轮收敛",
+   "turns": [
+    "空调不制冷，而且系统响应迟滞"
+   ],
+   "expect_phenomena": [
+    "空调"
+   ],
+   "expect_cause": [
+    "RC-IA-0069"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-019",
+   "layer": "L2",
+   "title": "批量：导航地图渲染卡顿——典型双现象组合，首轮收敛",
+   "turns": [
+    "中控屏显示异常，而且系统响应迟滞"
+   ],
+   "expect_phenomena": [
+    "中控"
+   ],
+   "expect_cause": [
+    "RC-IA-0070"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-020",
+   "layer": "L2",
+   "title": "批量：车机网络认证失败——典型双现象组合，首轮收敛",
+   "turns": [
+    "远程控车超时，而且OTA升级失败"
+   ],
+   "expect_phenomena": [
+    "远程"
+   ],
+   "expect_cause": [
+    "RC-IA-0071"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-021",
+   "layer": "L2",
+   "title": "批量：OTA升级过程中网络不稳定——典型双现象组合，首轮收敛",
+   "turns": [
+    "系统响应迟滞，而且OTA升级失败"
+   ],
+   "expect_phenomena": [
+    "系统"
+   ],
+   "expect_cause": [
+    "RC-IA-0082"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-022",
+   "layer": "L2",
+   "title": "批量：——典型双现象组合，首轮收敛",
+   "turns": [
+    "中控屏显示异常，而且OTA升级失败"
+   ],
+   "expect_phenomena": [
+    "中控"
+   ],
+   "expect_cause": [
+    "RC-IA-0084"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-023",
+   "layer": "L2",
+   "title": "批量：升级过程中电源断开——典型双现象组合，首轮收敛",
+   "turns": [
+    "无法上高压，而且OTA升级失败"
+   ],
+   "expect_phenomena": [
+    "无法"
+   ],
+   "expect_cause": [
+    "RC-IA-0086"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-024",
+   "layer": "L2",
+   "title": "批量：用户操作错误导致升级中断——典型双现象组合，首轮收敛",
+   "turns": [
+    "OTA升级失败，而且版本号显示异常"
+   ],
+   "expect_phenomena": [
+    "OT"
+   ],
+   "expect_cause": [
+    "RC-IA-0088"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "GEN-025",
+   "layer": "L1",
+   "title": "批量：单现象「ACC跟车异常」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点ACC跟车异常的问题"
+   ],
+   "expect_phenomena": [
+    "AC"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-026",
+   "layer": "L1",
+   "title": "批量：单现象「ADAS功能受限提示」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点ADAS功能受限提示的问题"
+   ],
+   "expect_phenomena": [
+    "AD"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-027",
+   "layer": "L1",
+   "title": "批量：单现象「OTA升级失败」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点OTA升级失败的问题"
+   ],
+   "expect_phenomena": [
+    "OT"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-028",
+   "layer": "L1",
+   "title": "批量：单现象「SOC跳变」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点SOC跳变的问题"
+   ],
+   "expect_phenomena": [
+    "SO"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-029",
+   "layer": "L1",
+   "title": "批量：单现象「SOH数值偏低」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点SOH数值偏低的问题"
+   ],
+   "expect_phenomena": [
+    "SO"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-030",
+   "layer": "L1",
+   "title": "批量：单现象「中控屏显示异常」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点中控屏显示异常的问题"
+   ],
+   "expect_phenomena": [
+    "中控"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-031",
+   "layer": "L1",
+   "title": "批量：单现象「仪表功率限制提示」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点仪表功率限制提示的问题"
+   ],
+   "expect_phenomena": [
+    "仪表"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-032",
+   "layer": "L1",
+   "title": "批量：单现象「充电中止」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点充电中止的问题"
+   ],
+   "expect_phenomena": [
+    "充电"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-033",
+   "layer": "L1",
+   "title": "批量：单现象「充电口过热」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点充电口过热的问题"
+   ],
+   "expect_phenomena": [
+    "充电"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-034",
+   "layer": "L1",
+   "title": "批量：单现象「充电速度低于预期」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点充电速度低于预期的问题"
+   ],
+   "expect_phenomena": [
+    "充电"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-035",
+   "layer": "L1",
+   "title": "批量：单现象「制动异响」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点制动异响的问题"
+   ],
+   "expect_phenomena": [
+    "制动"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-036",
+   "layer": "L1",
+   "title": "批量：单现象「加速抖动」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点加速抖动的问题"
+   ],
+   "expect_phenomena": [
+    "加速"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-037",
+   "layer": "L1",
+   "title": "批量：单现象「加速无力」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点加速无力的问题"
+   ],
+   "expect_phenomena": [
+    "加速"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-038",
+   "layer": "L1",
+   "title": "批量：单现象「动力输出受限」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点动力输出受限的问题"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-039",
+   "layer": "L1",
+   "title": "批量：单现象「无法上高压」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点无法上高压的问题"
+   ],
+   "expect_phenomena": [
+    "无法"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-040",
+   "layer": "L1",
+   "title": "批量：单现象「松油门后回收功率远低于标称值」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点松油门后回收功率远低于标称值的问题"
+   ],
+   "expect_phenomena": [
+    "松油"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-041",
+   "layer": "L1",
+   "title": "批量：单现象「滑行啸叫声」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点滑行啸叫声的问题"
+   ],
+   "expect_phenomena": [
+    "滑行"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-042",
+   "layer": "L1",
+   "title": "批量：单现象「满电续航显示下降」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点满电续航显示下降的问题"
+   ],
+   "expect_phenomena": [
+    "满电"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-043",
+   "layer": "L1",
+   "title": "批量：单现象「版本号显示异常」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点版本号显示异常的问题"
+   ],
+   "expect_phenomena": [
+    "版本"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-044",
+   "layer": "L1",
+   "title": "批量：单现象「空调不制冷」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点空调不制冷的问题"
+   ],
+   "expect_phenomena": [
+    "空调"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-045",
+   "layer": "L1",
+   "title": "批量：单现象「系统响应迟滞」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点系统响应迟滞的问题"
+   ],
+   "expect_phenomena": [
+    "系统"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-046",
+   "layer": "L1",
+   "title": "批量：单现象「绝缘报警灯亮」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点绝缘报警灯亮的问题"
+   ],
+   "expect_phenomena": [
+    "绝缘"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-047",
+   "layer": "L1",
+   "title": "批量：单现象「续航异常衰减」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点续航异常衰减的问题"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-048",
+   "layer": "L1",
+   "title": "批量：单现象「语音交互失效」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点语音交互失效的问题"
+   ],
+   "expect_phenomena": [
+    "语音"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-049",
+   "layer": "L1",
+   "title": "批量：单现象「远程控车超时」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点远程控车超时的问题"
+   ],
+   "expect_phenomena": [
+    "远程"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-050",
+   "layer": "L1",
+   "title": "批量：单现象「驱动系统异响」区分度不足，应追问不硬收敛",
+   "turns": [
+    "车有点驱动系统异响的问题"
+   ],
+   "expect_phenomena": [
+    "驱动"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-051",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「满电续航显示下降」收窄候选",
+   "turns": [
+    "续航异常衰减，满电续航显示下降",
+    "另外满电续航显示下降是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0003"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-052",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「仪表功率限制提示」收窄候选",
+   "turns": [
+    "无法上高压，仪表功率限制提示",
+    "另外仪表功率限制提示是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "无法"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0023"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-053",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「动力输出受限」收窄候选",
+   "turns": [
+    "续航异常衰减，动力输出受限",
+    "另外动力输出受限是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0025"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-054",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「空调不制冷」收窄候选",
+   "turns": [
+    "续航异常衰减，空调不制冷",
+    "另外空调不制冷是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0037"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-055",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「动力输出受限」收窄候选",
+   "turns": [
+    "动力输出受限，无法上高压",
+    "另外动力输出受限是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0039"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-056",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「动力输出受限」收窄候选",
+   "turns": [
+    "满电续航显示下降，动力输出受限",
+    "另外动力输出受限是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "满电"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0040"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-057",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「无法上高压」收窄候选",
+   "turns": [
+    "续航异常衰减，无法上高压",
+    "另外无法上高压是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "续航"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0041"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-058",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「充电速度低于预期」收窄候选",
+   "turns": [
+    "动力输出受限，充电速度低于预期",
+    "另外充电速度低于预期是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0042"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-059",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「仪表功率限制提示」收窄候选",
+   "turns": [
+    "仪表功率限制提示，空调不制冷",
+    "另外仪表功率限制提示是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "仪表"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0047"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-060",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「动力输出受限」收窄候选",
+   "turns": [
+    "动力输出受限，绝缘报警灯亮",
+    "另外动力输出受限是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0048"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-061",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「驱动系统异响」收窄候选",
+   "turns": [
+    "动力输出受限，驱动系统异响",
+    "另外驱动系统异响是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "动力"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0052"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-062",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「语音交互失效」收窄候选",
+   "turns": [
+    "语音交互失效，OTA升级失败",
+    "另外语音交互失效是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "语音"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0053"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-063",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「充电中止」收窄候选",
+   "turns": [
+    "充电中止，充电速度低于预期",
+    "另外充电中止是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "充电"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-EV-0054"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-064",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「中控屏显示异常」收窄候选",
+   "turns": [
+    "中控屏显示异常，语音交互失效",
+    "另外中控屏显示异常是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "中控"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-IA-0075"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "GEN-065",
+   "layer": "L4",
+   "title": "批量：ECU硬件故障阻碍升级——否认竞争现象「中控屏显示异常」收窄候选",
+   "turns": [
+    "空调不制冷，中控屏显示异常",
+    "另外中控屏显示异常是不存在的，没这个问题"
+   ],
+   "expect_phenomena": [
+    "空调"
+   ],
+   "expect_denied_nonempty": true,
+   "expect_cause": [
+    "RC-IA-0081"
+   ],
+   "expect_converged": false
+  }
+ ]
 }

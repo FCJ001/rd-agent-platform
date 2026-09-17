@@ -48,8 +48,9 @@ async def _post(endpoint: str, body: dict, ctx: UserContext, timeout: int = 30) 
         logger.warning(f"[REMOTE] 请求超时: {url}")
         return {"error": "知识库服务响应超时，请稍后重试"}
     except Exception as e:
+        # 细节（内网 URL/主机名）只进日志；str(e) 回给 LLM 会随答复漏给用户
         logger.warning(f"[REMOTE] 请求失败: {url} err={e}")
-        return {"error": f"知识库服务异常: {str(e)}"}
+        return {"error": "知识库服务异常，请稍后重试"}
 
 
 async def _post_bi(endpoint: str, body: dict, ctx: UserContext, timeout: int = 60) -> dict:
@@ -70,8 +71,9 @@ async def _post_bi(endpoint: str, body: dict, ctx: UserContext, timeout: int = 6
         logger.warning(f"[REMOTE] ChatBI 请求超时: {url}")
         return {"error": "BI 服务响应超时，请稍后重试"}
     except Exception as e:
+        # 同 _post：异常细节只进日志，不回给 LLM → 用户
         logger.warning(f"[REMOTE] ChatBI 请求失败: {url} err={e}")
-        return {"error": f"BI 服务异常: {str(e)}"}
+        return {"error": "BI 服务异常，请稍后重试"}
 
 
 def _unwrap(data: dict) -> dict:

@@ -1,10 +1,13 @@
 """Supervisor Agent — 总调度 Agent，按用户意图路由到对应 Worker 工具。"""
 
+import asyncio
+
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.redis import AsyncRedisSaver
 
+from src.agents.tools.history_tools import search_past_diagnoses
 from src.agents.tools.store_tools import save_memory, search_memory
 from src.agents.tools.worker_tools import WORKER_TOOLS
 from src.agents.tools.tool_call_repair import ToolCallRepairMiddleware
@@ -62,23 +65,33 @@ SUPERVISOR_SYSTEM_PROMPT = """你是汽车研发领域的智能总助手，服�
   适用：诊断出明确根因且修复方案明确时，在 ALM 平台提交结案建议
   用法：传入问题单号、根因、修复措施。注意：Agent 只建议结案，最终由平台审批
 
-## 记忆工具
+## 记忆与历史结论（两者分工不同，别混用）
 
-- **search_memory**：检索该用户/车辆的历史故障记录和诊断历史
-- **save_memory**：将重要的诊断结论、车辆信息保存到长期记忆
+- **search_memory**：检索**关于人和车的事实** —— 车型、更换记录、使用环境、偏好
+- **save_memory**：保存上述**事实**。★ 不要用它存诊断结论（根因/现象/置信度）
+- **search_past_diagnoses**：检索**历史诊断结论**（别人诊断过的根因也能拿到）
+  - 用户问「上次那个问题怎么解决的」「以前有没有遇到过」时用它
+  - 默认查本人（scope=mine）；问「有没有人遇到过」用 scope=line（本业务线共享，
+    客户角色会被自动降级为 mine）
+  - 传现象关键词而不是用户整句原话
 
 ## 工作原则
 
-1. **每次收到用户消息，必须先调用 search_memory** 检索历史记录，再决定下一步。
-2. 用户描述新故障现象时 → 先 search_memory → 再 call_dedup_check 检查重复 → 再 call_triage_agent。诊断收敛后，**主动列出三个操作选项供用户选择**：
+1. **每次收到用户消息，必须先调用 search_memory** 检索该用户/车辆的事实记录，再决定下一步。
+2. 用户描述新故障现象时 → 先 search_memory → 再 search_past_diagnoses（看有没有现成结论）
+   → 再 call_dedup_check 检查重复 → 再 call_triage_agent。诊断收敛后，**主动列出三个操作选项供用户选择**：
 	   - call_create_issue：创建问题单正式跟踪
 	   - 跳转平台：提供 ALM 平台链接查看历史问题单
 	   - call_close_issue：如根因明确且修复方案已定，提交结案建议
 	   用户回复"创建"/"跳转"/"结案"或直接描述需求即可，你根据选择调用对应的工具。注意：数字编号留给分诊追问用，操作选项用中文关键词避免冲突。
-3. 用户提到"之前"、"上次"、"又出现"、"也出现过"、"再来一次"等回顾性表述 → search_memory 查历史诊断记录，如命中则告知用户之前的结论，并询问是否需要重新诊断。
-4. 诊断完成后 → save_memory 保存关键结论（根因、现象、DTC码），然后列出操作选项（见原则 2）。
+3. 用户提到"之前"、"上次"、"又出现"、"也出现过"、"再来一次"等回顾性表述
+   → 用 **search_past_diagnoses** 查历史诊断结论（不是 search_memory），命中则告知结论与根因，
+   并询问是否需要重新诊断。返回文本若标注「尚未经人工复核」，转述时必须保留这个限定。
+4. 诊断完成后 → **不要**用 save_memory 保存诊断结论（结论已由系统自动沉淀到知识库，
+   可被同项目其他人复用）。只在有关于人/车的新事实时才调用 save_memory。然后列出操作选项（见原则 2）。
 5. 用户提到具体问题单号（如 ISS-xxx）→ call_link_issue 关联该单 → call_triage_agent 诊断。
 6. 传递消息规则：message 参数原样传递用户输入，不要改写。
+   （例外：search_past_diagnoses 的 phenomena 要传现象关键词，不是原句）
 7. 语气专业但易懂，不过度使用专业术语。
 8. 用户询问技术参数、规范标准、专业知识时 → 先 call_knowledge_agent 查知识库。
 9. 用户询问统计数据、趋势报表时 → 调 call_operation_agent 查询 BI 数据。
@@ -89,14 +102,23 @@ SUPERVISOR_SYSTEM_PROMPT = """你是汽车研发领域的智能总助手，服�
 async def create_supervisor_agent():
     """创建 Supervisor Agent，装配 Redis checkpointer + Milvus 长期记忆。"""
 
-    # Redis checkpointer（短期记忆）
+    # Redis checkpointer（短期记忆）。
+    # ★ 必须配 TTL：不配则每个 thread 的 checkpoint 永久驻留 Redis，
+    #   长期运行内存只增不减。默认 7 天 + 读时续期（CHECKPOINTER_TTL_MINUTES），
+    #   覆盖「用户隔很久才回来回答追问」的场景。
     redis_client = get_checkpointer_redis()
-    checkpointer = AsyncRedisSaver(redis_client=redis_client)
+    checkpointer = AsyncRedisSaver(
+        redis_client=redis_client,
+        ttl={
+            "default_ttl": settings.CHECKPOINTER_TTL_MINUTES,  # 单位：分钟
+            "refresh_on_read": True,
+        },
+    )
     await checkpointer.asetup()
 
-    # Milvus Store（长期记忆）
+    # Milvus Store（长期记忆）；connect 是同步网络调用，丢线程池
     from langchain_community.embeddings import DashScopeEmbeddings
-    milvus_alias = get_milvus_client_alias()
+    milvus_alias = await asyncio.to_thread(get_milvus_client_alias)
     embedding_model = DashScopeEmbeddings(model="text-embedding-v3", dashscope_api_key=settings.DASHSCOPE_API_KEY)
     store = MilvusStore(alias=milvus_alias, embeddings=embedding_model, dims=1024)
 
@@ -109,7 +131,7 @@ async def create_supervisor_agent():
         timeout=60,
     )
 
-    tools = [save_memory, search_memory] + WORKER_TOOLS
+    tools = [save_memory, search_memory, search_past_diagnoses] + WORKER_TOOLS
 
     agent = create_agent(
         model=llm,
@@ -132,11 +154,18 @@ async def create_supervisor_agent():
 
 
 _supervisor_agent = None
+_supervisor_lock = asyncio.Lock()
 
 
 async def get_supervisor_agent():
-    """获取 Supervisor Agent 单例。"""
+    """获取 Supervisor Agent 单例。
+
+    ★ 双检锁：初始化里有 asetup / 建索引等非幂等操作，
+      并发首请求不加锁会重复执行（多进程各一份属正常，进程内必须串行）。
+    """
     global _supervisor_agent
     if _supervisor_agent is None:
-        _supervisor_agent = await create_supervisor_agent()
+        async with _supervisor_lock:
+            if _supervisor_agent is None:
+                _supervisor_agent = await create_supervisor_agent()
     return _supervisor_agent

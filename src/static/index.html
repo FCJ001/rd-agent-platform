@@ -359,6 +359,11 @@ const store = {
   triageState: null, // context from last assistant reply
 };
 
+// 身份由服务端认证（X-User-Id 仅 dev 环境直通；生产用 X-Auth-Token）。
+// 角色切换 = 切换演示用户（seed_users 的账号映射），前端不再自报角色。
+const ROLE_USER = { engineer:'1', business:'10', aftersales:'12', customer:'13' };
+store.user_id = ROLE_USER[store.role] || '1';
+
 /* ══════════════════════════════════════════════════════════════
    Init
    ══════════════════════════════════════════════════════════════ */
@@ -458,8 +463,9 @@ async function send(msg) {
   let full = '';
   try {
     const resp = await fetch(BASE+'/api/v1/chat/stream', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({user_id:'web',session_id:store.activeSid,message:text,role:store.role})
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':store.user_id},
+      body: JSON.stringify({session_id:store.activeSid,message:text})
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -608,8 +614,9 @@ async function sendActionReply(msg) {
   const placeholder = appendMessage('assistant','<div class="typing"><span></span><span></span><span></span></div>',true);
   try {
     const resp = await fetch(BASE+'/api/v1/chat/stream',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({user_id:'web',session_id:store.activeSid,message:msg,role:store.role})
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-User-Id':store.user_id},
+      body:JSON.stringify({session_id:store.activeSid,message:msg})
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -798,6 +805,7 @@ function toggleTheme() {
 function onRoleChange() {
   store.role = document.getElementById('roleSelect').value;
   localStorage.setItem('rd_role',store.role);
+  store.user_id = ROLE_USER[store.role] || '1';
 }
 
 init();

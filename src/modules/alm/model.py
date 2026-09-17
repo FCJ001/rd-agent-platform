@@ -16,6 +16,7 @@
 # ============================================================
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Float,
     ForeignKey,
@@ -42,6 +43,10 @@ class AlmIssue(BaseModel):
     __tablename__ = "alm_issues"
 
     issue_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="平台问题单号，如 ISS-2025-00123")
+    # ★ 平台侧版本号：webhook upsert 用 WHERE entity_version < EXCLUDED.entity_version
+    #    防乱序/旧事件覆盖新数据。0 = 种子脚本/存量数据（首个事件即可覆盖）
+    entity_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0",
+                                                comment="平台侧版本号，乱序防护")
     title: Mapped[str] = mapped_column(String(500), nullable=False, comment="问题标题")
     description: Mapped[str | None] = mapped_column(Text, comment="问题详述（客户投诉原文 / 工程师描述）")
     # ★ 四类反馈来源，决定三层标准化第一层的抽取策略和最终输出话术
@@ -71,6 +76,10 @@ class AlmRequirement(BaseModel):
     __tablename__ = "alm_requirements"
 
     req_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="需求编号，如 REQ-EV-0042")
+    # ★ 平台侧版本号：webhook upsert 用 WHERE entity_version < EXCLUDED.entity_version
+    #    防乱序/旧事件覆盖新数据。0 = 种子脚本/存量数据（首个事件即可覆盖）
+    entity_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0",
+                                                comment="平台侧版本号，乱序防护")
     title: Mapped[str] = mapped_column(String(500), nullable=False, comment="需求标题")
     description: Mapped[str | None] = mapped_column(Text, comment="需求描述")
     business_line: Mapped[str] = mapped_column(String(10), nullable=False, default="ev", comment="业务线")
@@ -87,6 +96,10 @@ class AlmChangeRequest(BaseModel):
     __tablename__ = "alm_change_requests"
 
     cr_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="变更单号，如 CR-2025-0088")
+    # ★ 平台侧版本号：webhook upsert 用 WHERE entity_version < EXCLUDED.entity_version
+    #    防乱序/旧事件覆盖新数据。0 = 种子脚本/存量数据（首个事件即可覆盖）
+    entity_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0",
+                                                comment="平台侧版本号，乱序防护")
     title: Mapped[str] = mapped_column(String(500), nullable=False, comment="变更标题")
     reason: Mapped[str | None] = mapped_column(Text, comment="变更原因")
     scope_desc: Mapped[str | None] = mapped_column(Text, comment="变更范围自然语言描述（LLM 解析入口）")
@@ -104,6 +117,10 @@ class AlmConfigItem(BaseModel):
     __tablename__ = "alm_config_items"
 
     ci_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="配置项编号，如 CI-BMS-001")
+    # ★ 平台侧版本号：webhook upsert 用 WHERE entity_version < EXCLUDED.entity_version
+    #    防乱序/旧事件覆盖新数据。0 = 种子脚本/存量数据（首个事件即可覆盖）
+    entity_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0",
+                                                comment="平台侧版本号，乱序防护")
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="配置项名称，如 电池管理系统BMS")
     alias: Mapped[str | None] = mapped_column(String(500), comment="别名，逗号分隔（三层标准化第一层用）")
     category: Mapped[str] = mapped_column(String(30), default="software", comment="类别：software/hardware/calibration/doc")
@@ -128,6 +145,10 @@ class AlmBaseline(BaseModel):
     __tablename__ = "alm_baselines"
 
     baseline_no: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="基线编号，如 BL-EV-2025Q1")
+    # ★ 平台侧版本号：webhook upsert 用 WHERE entity_version < EXCLUDED.entity_version
+    #    防乱序/旧事件覆盖新数据。0 = 种子脚本/存量数据（首个事件即可覆盖）
+    entity_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0",
+                                                comment="平台侧版本号，乱序防护")
     name: Mapped[str] = mapped_column(String(200), nullable=False, comment="基线名称")
     business_line: Mapped[str] = mapped_column(String(10), nullable=False, default="ev", comment="业务线")
     is_frozen: Mapped[bool] = mapped_column(Boolean, default=False, comment="是否已冻结")
@@ -185,13 +206,19 @@ class Phenomenon(BaseModel):
     __tablename__ = "phenomena"
 
     code: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, comment="现象码，如 PH-IA-001")
-    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, comment="标准现象名称，如：中控屏显示异常")
+    # ★ name 不全局唯一：(business_line, name) 才是键。现象名是跨业务线共享的
+    #   词汇表（实测 26 个名有 13 个跨线），按 name 唯一会把两条线的现象塌成
+    #   一行，business_line 被后写入者覆盖。
+    name: Mapped[str] = mapped_column(String(200), nullable=False, comment="标准现象名称，如：中控屏显示异常")
     business_line: Mapped[str] = mapped_column(String(10), nullable=False, default="ev", comment="业务线")
     # ★ 口语别名，是三层标准化第一层 LLM 归一规则的数据来源
     colloquial: Mapped[str | None] = mapped_column(Text, comment="客户口语说法，逗号分隔，如：黑屏,白屏,花屏,死机")
     category: Mapped[str | None] = mapped_column(String(50), comment="现象分类，如：显示类/动力类/充电类")
 
-    __table_args__ = (Index("ix_phenomena_name", "name"),)
+    __table_args__ = (
+        UniqueConstraint("business_line", "name", name="uq_phenomena_line_name"),
+        Index("ix_phenomena_name", "name"),
+    )
 
 
 class CausePhenomenon(BaseModel):
@@ -219,13 +246,18 @@ class DtcCode(BaseModel):
 
     __tablename__ = "dtc_codes"
 
-    code: Mapped[str] = mapped_column(String(10), unique=True, nullable=False, comment="故障码，如 P0A0F / U0155")
+    # ★ code 不全局唯一：(business_line, code) 才是键。DTC 码同样跨线共享
+    #   （实测 U0155 在 ev / ia 两条线都出现），按 code 唯一会塌成一个节点。
+    code: Mapped[str] = mapped_column(String(10), nullable=False, comment="故障码，如 P0A0F / U0155")
     system: Mapped[str] = mapped_column(String(30), nullable=False, comment="系统：powertrain/chassis/body/network")
     description: Mapped[str | None] = mapped_column(Text, comment="英文原始描述")
     description_zh: Mapped[str | None] = mapped_column(Text, comment="中文描述（LLM 批量翻译）")
     business_line: Mapped[str] = mapped_column(String(10), nullable=False, default="ev", comment="业务线（码段规则映射，不过 LLM）")
 
-    __table_args__ = (Index("ix_dtc_line", "business_line"),)
+    __table_args__ = (
+        UniqueConstraint("business_line", "code", name="uq_dtc_line_code"),
+        Index("ix_dtc_line", "business_line"),
+    )
 
 
 # ==========================================================
@@ -240,6 +272,11 @@ class AiTriageResult(BaseModel):
     __tablename__ = "ai_triage_results"
 
     source_issue_id: Mapped[int | None] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), comment="来源问题单")
+    # ★ 行归属与作用域：结论要能被「谁诊断的」和「哪条业务线」两个维度检索，
+    #   否则它只能躺在个人记忆里，别人诊断过的同一故障无法复用。
+    #   NULL = 迁移前存量 / 自动分诊（无发起人）；检索侧对 NULL fail-closed
+    user_id: Mapped[int | None] = mapped_column(BigInteger, comment="诊断发起人用户 ID（users.id）")
+    business_line: Mapped[str | None] = mapped_column(String(10), comment="业务线（作用域）")
     session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID（对应 Redis triage_state key）")
     raw_input: Mapped[str | None] = mapped_column(Text, comment="用户原始描述")
     confirmed_phenomena: Mapped[str | None] = mapped_column(Text, comment="已确认现象 JSON 数组")
@@ -257,6 +294,7 @@ class AiTriageResult(BaseModel):
     __table_args__ = (
         Index("ix_triage_session", "session_id"),
         Index("ix_triage_issue", "source_issue_id"),
+        Index("ix_triage_line", "business_line"),
     )
 
 
@@ -301,6 +339,9 @@ class AiImpactAnalysis(BaseModel):
     __tablename__ = "ai_impact_analysis"
 
     change_request_id: Mapped[int | None] = mapped_column(ForeignKey("alm_change_requests.id", ondelete="CASCADE"), comment="来源变更单 ID")
+    # ★ 行归属：反馈回写按 user_id 过滤（feedback.py 所有权校验）。
+    #   NULL = 迁移前的存量行，反馈接口对它们 fail-closed（不可被任何人更新）
+    user_id: Mapped[int | None] = mapped_column(BigInteger, comment="创建者用户 ID（users.id）")
     session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID")
     raw_input: Mapped[str | None] = mapped_column(Text, comment="用户原始输入")
     scope_result: Mapped[str | None] = mapped_column(Text, comment="影响范围 JSON")
@@ -324,6 +365,9 @@ class AiReportInterpretation(BaseModel):
     __tablename__ = "ai_report_interpretations"
 
     source_issue_id: Mapped[int | None] = mapped_column(ForeignKey("alm_issues.id", ondelete="CASCADE"), comment="来源问题单 ID")
+    # ★ 行归属：反馈回写按 user_id 过滤（feedback.py 所有权校验）。
+    #   NULL = 迁移前的存量行，反馈接口对它们 fail-closed（不可被任何人更新）
+    user_id: Mapped[int | None] = mapped_column(BigInteger, comment="创建者用户 ID（users.id）")
     session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID")
     report_type: Mapped[str] = mapped_column(String(30), nullable=False, comment="报告类型：DTC扫描/台架测试/OTA回归")
     minio_key: Mapped[str | None] = mapped_column(String(200), comment="MinIO 附件路径")

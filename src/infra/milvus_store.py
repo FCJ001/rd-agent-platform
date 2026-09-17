@@ -87,8 +87,14 @@ class MilvusStore(BaseStore):
     # ── BaseStore 核心方法 ──
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
-        """同步批量执行。用 asyncio.run() 避免 thread pool 无 event loop。"""
-        return asyncio.run(self.abatch(list(ops)))
+        """同步批量执行。仅在无 event loop 的上下文（脚本/线程池）可用。"""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.abatch(list(ops)))
+        raise RuntimeError(
+            "MilvusStore.batch 不能在运行中的 event loop 里调用（asyncio.run 会炸），请用 abatch"
+        )
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         """异步批量执行（核心实现）。"""
@@ -109,30 +115,43 @@ class MilvusStore(BaseStore):
         return results
 
     # ── 具体操作 ──
+    # pymilvus 的 delete/insert/flush/query/search 全是同步网络 IO，
+    # 必须丢线程池执行，否则会阻塞 event loop（所有并发会话一起卡）
 
-    async def _aput(self, namespace: tuple[str, ...], key: str, value: dict[str, Any] | None) -> None:
-        doc_id = self._make_id(namespace, key)
-        if value is None:
-            self._collection.delete(f'id == "{doc_id}"')
-            return
-
-        text_for_embed = json.dumps(value, ensure_ascii=False)
-        embedding = await self._aembed_text(text_for_embed)
-
+    def _put_sync(self, doc_id: str, namespace: str, key: str, value_json: str, embedding: list[float]) -> None:
         self._collection.delete(f'id == "{doc_id}"')
         self._collection.insert([{
             "id": doc_id,
-            "namespace": self._ns_to_str(namespace),
+            "namespace": namespace,
             "key": key,
-            "value_json": text_for_embed,
+            "value_json": value_json,
             "embedding": embedding,
             "created_at": time.time(),
         }])
         self._collection.flush()
 
+    async def _aput(self, namespace: tuple[str, ...], key: str, value: dict[str, Any] | None) -> None:
+        doc_id = self._make_id(namespace, key)
+        if value is None:
+            await asyncio.to_thread(self._collection.delete, f'id == "{doc_id}"')
+            return
+
+        text_for_embed = json.dumps(value, ensure_ascii=False)
+        embedding = await self._aembed_text(text_for_embed)
+
+        await asyncio.to_thread(
+            self._put_sync,
+            doc_id,
+            self._ns_to_str(namespace),
+            key,
+            text_for_embed,
+            embedding,
+        )
+
     async def _aget(self, namespace: tuple[str, ...], key: str) -> Item | None:
         doc_id = self._make_id(namespace, key)
-        results = self._collection.query(
+        results = await asyncio.to_thread(
+            self._collection.query,
             expr=f'id == "{doc_id}"',
             output_fields=["id", "namespace", "key", "value_json", "created_at"],
         )
@@ -152,7 +171,8 @@ class MilvusStore(BaseStore):
         ns_filter = self._ns_to_str(namespace_prefix)
 
         if not query:
-            results = self._collection.query(
+            results = await asyncio.to_thread(
+                self._collection.query,
                 expr=f'namespace like "{ns_filter}%"',
                 output_fields=["id", "namespace", "key", "value_json", "created_at"],
                 limit=limit,
@@ -160,7 +180,8 @@ class MilvusStore(BaseStore):
             return [self._item_from_hit(r) for r in results]
 
         query_vec = await self._aembed_text(query)
-        search_results = self._collection.search(
+        search_results = await asyncio.to_thread(
+            self._collection.search,
             data=[query_vec],
             anns_field="embedding",
             param={"metric_type": "COSINE", "params": {"nprobe": 16}},

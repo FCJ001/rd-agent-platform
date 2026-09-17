@@ -111,17 +111,22 @@ def delete_issue(issue_id: int) -> None:
 
 def search_similar(
     query_embedding: list[float],
-    business_line: str,
+    business_line: str = "",
     exclude_id: int | None = None,
     top_k: int = SEARCH_TOP_K,
 ) -> list[dict]:
     """ANN 近邻检索，返回 [{id: int, issue_no: str, similarity: float}, ...]。
 
-    business_line 精确过滤 + 排除自身；相似度即 Milvus COSINE 分数。"""
+    business_line 非空时按业务线精确过滤 + 排除自身；留空 = 跨线检索
+    （调用方拿不到 scope 时的兼容路径），精度由上层结构化门槛兜住。
+    相似度即 Milvus COSINE 分数。"""
     collection = _get_collection()
-    expr = f'business_line == "{business_line}"'
+    clauses = []
+    if business_line:
+        clauses.append(f'business_line == "{business_line}"')
     if exclude_id:
-        expr += f' and id != "{exclude_id}"'
+        clauses.append(f'id != "{exclude_id}"')
+    expr = " and ".join(clauses) or None
 
     results = collection.search(
         data=[query_embedding],

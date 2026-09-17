@@ -1,0 +1,39 @@
+# ============================================================
+# CI：纯函数单测 + 导入冒烟（不起任何外部服务）
+#
+# 集成测试（tests/test_row_filter.py，依赖 docker 全套服务）
+# 标记为 integration，默认不在 CI 跑 —— 接入 self-hosted runner
+# 或服务化测试环境后再放开。
+# ============================================================
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests (no external services)
+        run: pytest -m "not integration" -q
+
+      - name: Import smoke test
+        run: python -c "import src.main; import src.agents.supervisor_agent; print('imports ok')"
+        env:
+          # 冒烟不连真实服务，给空密钥即可（不得在 CI 放真实密钥）
+          DASHSCOPE_API_KEY: "sk-ci-placeholder"
+          AUTH_SECRET: "ci-test-secret"
+          WEBHOOK_SECRET: "ci-webhook-secret"

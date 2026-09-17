@@ -321,13 +321,15 @@ sla_deadline: datetime | None   # 按 severity 自动设 SLA
 
 ### 4.3 反馈闭环的数据结构（修正：后端三段已齐）
 
-现有 `feedback_loop.py` **已经实现了三段**，后端闭环是完整的：
+现有 `feedback_loop.py` **实现了三段，但只有两段接上了**：
 
 | 段 | 触发 | 动作 | 现有实现 |
 |---|---|---|---|
-| 正向增强 | 结论被采纳 | `MERGE (rc)-[r:INDICATES]->(ph)`，已有关系 ×1.05（上限 1.0），新关系从 0.3 起 | `reinforce_graph_on_adopted()` ✅ |
-| 历史复用 | 新故障匹配到已闭环单 | 查 `ai_triage_results` 返回历史结论并格式化 | `search_historical_cases()` + `format_historical_cases()` ✅ |
-| **误诊衰减** | 诊断被否决 | 权重 ×0.8；**< 0.1 时 `DELETE` 关系** | `weaken_graph_on_rejected()` ✅ |
+| 正向增强 | 结论被采纳 | `MERGE (rc)-[r:INDICATES]->(ph)`，已有关系 ×1.05（上限 1.0），新关系从 0.3 起 | `reinforce_graph_on_adopted()` ✅ 已接（feedback 路由） |
+| 历史复用 | 新故障匹配到已闭环单 | 查 `ai_triage_results` 返回历史结论并格式化 | ⚠️ 函数已实现，**未接入 graph** —— `search_historical_cases()` / `format_historical_cases()` 全仓库无调用点，triage graph 里没有这一步 |
+| **误诊衰减** | 诊断被否决 | 权重 ×0.6；连续 3 次否决或权重 < 0.1 时 `DELETE` 关系 | `weaken_graph_on_rejected()` ✅ 已接（feedback 路由） |
+
+★ 另注：`ai_triage_results` 目前**没有 business_line / tenant 列**，所以"按业务线复用历史结论"连数据基础都还不具备 —— 接入前要先补列并在写入时落值。
 
 写入侧入口：`POST /triage/feedback`（`api/routers/triage.py:119`）。
 

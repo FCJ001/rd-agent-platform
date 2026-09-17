@@ -62,3 +62,41 @@ def test_mask_free_text_no_false_positive_on_normal_text():
 def test_mask_free_text_empty():
     assert mask_free_text("") == ""
     assert mask_free_text(None) is None
+
+
+# ── 绕过向量回归（A1 评审修复后锁定）────────────────────────────────────
+
+def test_apply_mask_unknown_role_fails_closed():
+    """未知角色必须按最严格策略脱敏，绝不能 fail-open 返回原文。"""
+    data = {"vin": "LSVAA1234AB567890", "phone": "13812345678", "title": "黑屏"}
+    masked = apply_mask(dict(data), "unknown_role")
+    assert masked["vin"].endswith("567890") and not masked["vin"].startswith("LSV")
+    assert masked["phone"] == "138****5678"
+
+
+def test_mask_free_text_lowercase_vin():
+    """VIN 不区分大小写（ISO 3779），小写也要打码。"""
+    out = mask_free_text("vin: lsvaa1234ab567890 请查一下")
+    assert "lsvaa1234ab567890" not in out
+    assert "567890" in out
+
+
+def test_mask_free_text_phone_with_plus86():
+    """+86 前缀的手机号同样命中。"""
+    out = mask_free_text("联系 +8613812345678")
+    assert "8613812345678" not in out.replace("+86", "")  # 原完整号码不残留
+    assert "138****5678" in out
+
+
+def test_mask_free_text_email():
+    """自由文本里的邮箱也要打码。"""
+    out = mask_free_text("有问题发邮件到 zhangsan@example.com 反馈")
+    assert "zhangsan@example.com" not in out
+    assert "z***@example.com" in out
+
+
+def test_mask_free_text_plain_phone_without_plus_untouched_prefix():
+    """无前缀号码行为保持：数字串不被截断。"""
+    out = mask_free_text("工单号 2024112300012345 不是手机号")
+    assert "2024112300012345" in out  # 16 位长数字不是手机号，不误伤
+

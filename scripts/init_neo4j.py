@@ -47,6 +47,34 @@ def _clear(driver):
     logger.info("图谱已清空")
 
 
+def ensure_constraints(driver):
+    """复合唯一键 + 业务线索引。导入前建，让违反约束的写入立刻失败而不是静默塌缩。
+
+    ★ 唯一键必须带 business_line：现象名和 DTC 码是跨业务线共享的词汇表
+      （实测 26 个现象名有 13 个跨线、11 个 DTC 有 1 个跨线），只按 name/code
+      唯一会把两条线的节点合并成一个。RootCause.code 带线前缀，全局唯一即可。
+    """
+    stmts = [
+        "CREATE CONSTRAINT ph_line_name IF NOT EXISTS "
+        "FOR (ph:Phenomenon) REQUIRE (ph.business_line, ph.name) IS UNIQUE",
+        "CREATE CONSTRAINT dtc_line_code IF NOT EXISTS "
+        "FOR (d:DTC) REQUIRE (d.business_line, d.code) IS UNIQUE",
+        "CREATE CONSTRAINT rc_code IF NOT EXISTS "
+        "FOR (rc:RootCause) REQUIRE rc.code IS UNIQUE",
+        # 检索路径按 business_line 过滤，没有索引会退化成全扫
+        "CREATE INDEX ph_line IF NOT EXISTS FOR (ph:Phenomenon) ON (ph.business_line)",
+        "CREATE INDEX rc_line IF NOT EXISTS FOR (rc:RootCause) ON (rc.business_line)",
+        "CREATE INDEX dtc_line IF NOT EXISTS FOR (d:DTC) ON (d.business_line)",
+    ]
+    with driver.session() as s:
+        for stmt in stmts:
+            try:
+                s.run(stmt)
+            except Exception as e:
+                logger.warning(f"约束/索引创建失败（可能已有同义项）: {e}")
+    logger.info("Neo4j 约束与索引已就绪")
+
+
 def import_kg(driver):
     """导入诊断图谱：OwnerDomain / RootCause / Phenomenon + BELONGS_TO / INDICATES"""
     kg_path = DATA_DIR / "alm_kg.json"
@@ -67,13 +95,17 @@ def import_kg(driver):
 
         cause_count = phenom_count = cp_count = dtc_count = dtc_rel_count = 0
         for c in causes:
-            # RootCause 节点
+            # ★ business_line 参与身份键：现象名（13/26）和 DTC（U0155）存在跨业务线
+            #   重名，只按 code/name MERGE 会把两条线的节点塌成一个，属性被后写入者
+            #   覆盖。见 scripts/repair_kg_line_split.py 的存量修复。
+            line = c.get("business_line", "ev")
+            # RootCause 节点（code 带线前缀，全局唯一，无需复合键）
             s.run(
                 """MERGE (rc:RootCause {code: $code})
                    SET rc.name = $name, rc.domain = $domain, rc.business_line = $line,
                        rc.description = $desc, rc.fix_way = $fix_way, rc.fix_duration = $fix_duration,
                        rc.dtc = $dtc""",
-                code=c["code"], name=c["name"], domain=c.get("domain"), line=c.get("business_line"),
+                code=c["code"], name=c["name"], domain=c.get("domain"), line=line,
                 desc=c.get("description", ""), fix_way=c.get("fix_way", ""),
                 fix_duration=c.get("fix_duration", ""),
                 dtc=c.get("dtc", []),
@@ -83,15 +115,15 @@ def import_kg(driver):
             # DTC nodes + POINTS_TO relationship（从 rc.dtc 属性同步）
             for dtc_code in c.get("dtc", []):
                 s.run(
-                    """MERGE (d:DTC {code: $code})
-                       SET d.system = $system, d.business_line = $line""",
-                    code=dtc_code, system="", line=c.get("business_line", "ev"),
+                    """MERGE (d:DTC {code: $code, business_line: $line})
+                       SET d.system = $system""",
+                    code=dtc_code, system="", line=line,
                 )
                 s.run(
-                    """MATCH (d:DTC {code: $dtc_code})
+                    """MATCH (d:DTC {code: $dtc_code, business_line: $line})
                        MATCH (rc:RootCause {code: $cause_code})
                        MERGE (d)-[:POINTS_TO]->(rc)""",
-                    dtc_code=dtc_code, cause_code=c["code"],
+                    dtc_code=dtc_code, cause_code=c["code"], line=line,
                 )
                 dtc_count += 1
                 dtc_rel_count += 1
@@ -105,19 +137,18 @@ def import_kg(driver):
                     code=c["code"], domain=c["domain"],
                 )
 
-            # Phenomenon + INDICATES
+            # Phenomenon + INDICATES（name 参与复合键，理由同上）
             for pm in c.get("phenomena_meta", []):
                 s.run(
-                    """MERGE (ph:Phenomenon {name: $name})
-                       SET ph.business_line = $line""",
-                    name=pm["name"], line=c.get("business_line", "ev"),
+                    """MERGE (ph:Phenomenon {name: $name, business_line: $line})""",
+                    name=pm["name"], line=line,
                 )
                 s.run(
                     """MATCH (rc:RootCause {code: $code})
-                       MATCH (ph:Phenomenon {name: $name})
+                       MATCH (ph:Phenomenon {name: $name, business_line: $line})
                        MERGE (rc)-[r:INDICATES]->(ph)
                        SET r.weight = $weight, r.is_core = $is_core""",
-                    code=c["code"], name=pm["name"],
+                    code=c["code"], name=pm["name"], line=line,
                     weight=pm.get("weight", 1.0), is_core=pm.get("is_core", False),
                 )
                 phenom_count += 1
@@ -308,6 +339,16 @@ def import_graph_extras(driver):
 
 
 def main():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Neo4j 图谱导入")
+    ap.add_argument(
+        "--constraints-only", action="store_true",
+        help="只建约束与索引，不清图不导入 —— 已有数据的生产环境用这个"
+             "（默认流程会清空图谱，只能在开发/重建时用）",
+    )
+    args = ap.parse_args()
+
     settings = get_settings()
     # Neo4j 的 verify=True 需要 .local TLD hostname，本地测试关闭
     import ssl
@@ -321,8 +362,17 @@ def main():
     except Exception:
         logger.warning("Neo4j 连接验证失败，尝试继续...")
 
+    if args.constraints_only:
+        logger.info("只建约束与索引（不动数据）...")
+        ensure_constraints(driver)
+        driver.close()
+        return
+
     logger.info("清空旧图谱...")
     _clear(driver)
+
+    logger.info("0/4 建约束与索引...")
+    ensure_constraints(driver)
 
     logger.info("1/3 导入诊断图谱...")
     import_kg(driver)

@@ -44,7 +44,8 @@ async def _parse_change_request(description: str) -> dict:
             "scope": "",
             "target_baseline": "",
             "change_type": "其他",
-            "business_line": "ia",
+            # 不写死业务线：解析失败时留空，交由调用方（请求上下文）决定
+            "business_line": "",
             "risk_signals": [],
         }
 
@@ -78,7 +79,9 @@ async def _check_dependency(config_items: list[str]) -> dict:
         return {"conflicts": [], "summary": f"依赖检查异常: {str(e)}"}
 
 
-async def _check_baseline(config_items: list[str], target_baseline: str) -> dict:
+async def _check_baseline(
+    config_items: list[str], target_baseline: str, business_line: str = "",
+) -> dict:
     """检查基线冲突：三级匹配（exact → module → platform GraphRAG）。"""
     conflicts = []
     if not target_baseline or not config_items:
@@ -135,7 +138,7 @@ async def _check_baseline(config_items: list[str], target_baseline: str) -> dict
                     f"查找配置项 {', '.join(still_remaining)} 所在的平台/代际产品线，"
                     f"以及基线 {target_baseline} 是否冻结了同平台的其他配置项"
                 )
-                records = await search_graph_raw(query, driver, llm)
+                records = await search_graph_raw(query, driver, llm, business_line)
                 if records:
                     conflicts.append({
                         "config_item": ", ".join(still_remaining),
@@ -162,11 +165,16 @@ async def _check_duplicate(config_items: list[str]) -> dict:
 
     try:
         import psycopg2
+
+        from src.infra.pg_scope import apply_scope
+
         s = get_settings()
         conn = psycopg2.connect(
             host=s.DB_HOST, port=s.DB_PORT,
             user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
         )
+        # alm_config_items 受 RLS 管控：不带作用域会静默查空（重复变更检查失效）
+        apply_scope(conn)
         cur = conn.cursor()
 
         # 先查配置项的 category/module
@@ -219,7 +227,11 @@ async def _check_duplicate(config_items: list[str]) -> dict:
 
 
 async def _check_scope(config_items: list[str], business_line: str) -> dict:
-    """查询变更影响范围：哪些需求和配置项会受影响。"""
+    """查询变更影响范围：哪些需求和配置项会受影响。
+
+    business_line 非空时按配置项所属业务线过滤 —— 原先这个参数收下就丢，
+    等于影响范围跨线聚合（电动化的变更会把智能化的需求一起列进来）。
+    """
     if not config_items:
         return {"affected_requirements": [], "affected_config_items": [], "summary": "无法确定影响范围"}
 
@@ -228,14 +240,19 @@ async def _check_scope(config_items: list[str], business_line: str) -> dict:
         driver = get_neo4j_driver()
 
         # Neo4j 查询：配置项 → 实现的需求 → 同一需求下的其他配置项
-        cypher = """
+        # 谓词按需拼接，值始终走参数绑定
+        line_predicate = "AND ci.business_line = $business_line" if business_line else ""
+        cypher = f"""
         MATCH (ci:ConfigItem)-[:IMPLEMENTED_BY]-(r:Requirement)-[:IMPLEMENTED_BY]-(related:ConfigItem)
-        WHERE ci.name IN $items AND related.name <> ci.name
+        WHERE ci.name IN $items AND related.name <> ci.name {line_predicate}
         RETURN ci.name AS source, r.req_no AS req_no, r.title AS req_title,
                collect(DISTINCT related.name) AS affected_config_items
         """
+        params: dict = {"items": config_items}
+        if business_line:
+            params["business_line"] = business_line
         with driver.session() as session:
-            result = session.run(cypher, items=config_items)
+            result = session.run(cypher, **params)
             rows = [r.data() for r in result]
 
         if not rows:
@@ -256,22 +273,26 @@ async def _check_scope(config_items: list[str], business_line: str) -> dict:
         return {"affected_requirements": [], "affected_config_items": [], "summary": f"范围检查异常: {str(e)}"}
 
 
-async def analyze_impact(change_description: str) -> str:
+async def analyze_impact(change_description: str, business_line: str = "") -> str:
     """
     变更影响分析入口。
     4 路并行检查 → LLM 汇总 → 返回 Markdown 报告。
+
+    business_line 是数据作用域：调用方从请求上下文传入的优先，其次才用
+    LLM 从描述里解析出的值。之前硬编码兜底 "ia"，会让电动化的变更去比对
+    智能化的配置项与基线。留空 = 不做作用域过滤。
     """
     # Step 1: 解析变更描述
     parsed = await _parse_change_request(change_description)
     config_items = parsed.get("config_items", [])
     target_baseline = parsed.get("target_baseline", "")
-    business_line = parsed.get("business_line", "ia")
+    business_line = business_line or parsed.get("business_line", "")
 
     # Step 2: 4 路并行检查
     scope_result, dep_result, baseline_result, dup_result = await asyncio.gather(
         _check_scope(config_items, business_line),
         _check_dependency(config_items),
-        _check_baseline(config_items, target_baseline),
+        _check_baseline(config_items, target_baseline, business_line),
         _check_duplicate(config_items),
     )
 

@@ -64,8 +64,14 @@ class BaseRepository(Generic[T]):
         await self.db.delete(obj)
         await self.db.flush()
 
-    async def delete_by_id(self, id: int) -> None:
+    async def delete_by_id(
+        self, id: int, filters: Sequence[ColumnElement[bool]] | None = None,
+    ) -> None:
+        """按主键删除。★ filters 语义与 get_by_id 一致：删除同样必须过行级权限，
+        否则「列表挡住了、详情挡住了、删除却直通」就是最典型的越权入口。"""
         stmt = delete(self.model).where(self.model.id == id)
+        if filters:
+            stmt = stmt.where(*filters)
         await self.db.execute(stmt)
 
     async def get_page(
@@ -95,11 +101,16 @@ class BaseRepository(Generic[T]):
 
         # ② 关键词：多个字段之间是 OR
         if keyword and search_fields:
+            # 转义 LIKE 通配符：用户传 "%" 会变成全表模糊扫描，
+            # 既拖垮查询也让 total 统计失真
+            escaped = (
+                keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
             conditions = []
             for field_name in search_fields:
                 column = getattr(self.model, field_name, None)
                 if column is not None:
-                    conditions.append(column.ilike(f"%{keyword}%"))
+                    conditions.append(column.ilike(f"%{escaped}%"))
             if conditions:
                 stmt = stmt.where(or_(*conditions))
 

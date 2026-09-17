@@ -1,9 +1,9 @@
 """分诊 StateGraph。参考天宫医疗版 inquiry/graph.py（10 节点拓扑）。"""
 
+import asyncio
 import json
-import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -20,6 +20,7 @@ from src.agents.triage.db_queries import (
     lookup_dtc_codes, save_triage_result,
 )
 from src.agents.triage.graph_queries import query_causes_by_phenomena, enrich_cause_details
+from src.utils.business_line import resolve_business_line
 from src.agents.triage.confidence import (
     apply_context_weights, check_convergence, merge_evidence, MAX_ROUNDS,
     EVIDENCE_GRADE_INSTRUMENT, EVIDENCE_GRADE_REPORTED,
@@ -27,6 +28,7 @@ from src.agents.triage.confidence import (
 )
 from src.core.config import get_settings
 from src.core.logger import logger
+from src.utils.dtc import extract_dtc_codes
 
 
 settings = get_settings()
@@ -36,7 +38,11 @@ settings = get_settings()
 class TriageDeps:
     llm_json: ChatOpenAI   # for structured JSON output (extract, parse)
     llm_chat: ChatOpenAI   # for natural language output (ask, conclude)
+    # 返回 async context manager 的工厂（infra.db.session_scope），
+    # 退出时提交/回滚/关闭一体 —— 节点里 `async with deps.db_session_factory() as db` 使用
     db_session_factory: callable
+    # 编译好的图缓存（build_triage_graph 闭包绑定本 deps，可安全复用）
+    graph_cache: dict = field(default_factory=dict)
 
 
 def _get_llm_json() -> ChatOpenAI:
@@ -97,22 +103,27 @@ async def node_load_issue(state: TriageState, deps: TriageDeps) -> dict:
         return {}
 
     logger.info(f"[TRIAGE] 节点① load_issue id={state.issue_id} round={state.round}")
-    async for db in deps.db_session_factory():
-        try:
-            ctx = await load_issue_context(db, state.issue_id)
-            if ctx:
-                result = {
-                    "issue_title": ctx["issue_title"],
-                    "issue_desc": ctx["issue_desc"],
-                    "issue_dtc_snapshot": ctx["issue_dtc_snapshot"],
-                }
-                if not state.viewer_role or state.viewer_role == "customer":
-                    result["viewer_role"] = ctx.get("source", "customer")
-                logger.info(f"[TRIAGE] 节点① issue_loaded title={ctx['issue_title'][:50]} viewer_role={result.get('viewer_role')}")
-                return result
-            return {}
-        finally:
-            break
+    # session_scope：退出时提交/回滚/关闭一体。
+    # ★ 旧写法 `async for db in factory(): try: return ... finally: break`
+    #   里 finally 的 break 会丢弃挂起的 return —— 本节点恒返回 None，
+    #   问题单上下文从来没进过状态。
+    async with deps.db_session_factory() as db:
+        ctx = await load_issue_context(db, state.issue_id)
+    if not ctx:
+        return {}
+    result = {
+        "issue_title": ctx["issue_title"],
+        "issue_desc": ctx["issue_desc"],
+        "issue_dtc_snapshot": ctx["issue_dtc_snapshot"],
+    }
+    # 问题单的业务线是权威来源，覆盖入口传入的推断值（入口可能只拿到用户的
+    # 所属线，而单子可能属于另一条线）
+    if ctx.get("business_line"):
+        result["business_line"] = ctx["business_line"]
+    if not state.viewer_role or state.viewer_role == "customer":
+        result["viewer_role"] = ctx.get("source", "customer")
+    logger.info(f"[TRIAGE] 节点① issue_loaded title={ctx['issue_title'][:50]} viewer_role={result.get('viewer_role')}")
+    return result
 
 
 async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
@@ -137,14 +148,18 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
 
     try:
         parsed = _parse_llm_json(response)
-        new_phenomena = parsed.get("phenomena", [])
-        hedged = parsed.get("hedged_phenomena", [])
-        new_dtc = parsed.get("dtc_codes", [])
     except Exception:
         logger.warning(f"[TRIAGE] 节点② LLM JSON 解析失败")
-        new_phenomena = []
-        hedged = []
-        new_dtc = []
+        parsed = {}
+
+    # Merge with existing
+    # parse_answer（上一节点）已对追问答案里的现象定级 confirmed；
+    # 本节点对同一条消息重新提取，若再次按 reported 定级，merge 的
+    # 「只升不降」会把 confirmed 抬成 reported，系统性高估置信度。
+    # 已确认的现象不重复定级。
+    new_phenomena = [p for p in parsed.get("phenomena", []) if p not in state.confirmed_phenomena]
+    hedged = parsed.get("hedged_phenomena", [])
+    new_dtc = parsed.get("dtc_codes", [])
 
     logger.info(f"[TRIAGE] 节点② extracted phenomena={new_phenomena} hedged={hedged} dtc={new_dtc}")
 
@@ -160,7 +175,8 @@ async def node_extract_phenomena(state: TriageState, deps: TriageDeps) -> dict:
     }
     dtc_evidence_updates = {d: EVIDENCE_GRADE_REPORTED for d in new_dtc}
     if state.issue_dtc_snapshot and state.round == 0:
-        for d in re.findall(r"[A-Z]\d{4,5}", state.issue_dtc_snapshot):
+        # SAE 标准 DTC：字母开头 + 4 位十六进制（P0A7F 这类第三位是字母的不再漏）
+        for d in extract_dtc_codes(state.issue_dtc_snapshot):
             dtc_evidence_updates[d] = EVIDENCE_GRADE_INSTRUMENT
 
     if all_confirmed:
@@ -221,28 +237,30 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
     """节点③：L2 DB 匹配现象名→id + L3 Neo4j 查询候选根因 + 置信度计算。"""
     logger.info(f"[TRIAGE] 节点③ query_candidates confirmed={state.confirmed_phenomena} dtc={state.dtc_codes}")
     # Step 1: DB match phenomenon names → IDs
-    async for db in deps.db_session_factory():
-        try:
-            matched = await match_phenomena_by_names(db, state.confirmed_phenomena)
-            break
-        finally:
-            break
+    async with deps.db_session_factory() as db:
+        matched = await match_phenomena_by_names(
+            db, state.confirmed_phenomena, state.business_line
+        )
 
     if not matched:
         logger.info(f"[TRIAGE] 节点③ 无匹配现象 → force_conclude")
         return {"phase": TriagePhase.CONCLUDE, "force_conclude": True}
 
     # Step 2: Neo4j query candidate root causes
+    # graph_queries 是同步驱动（session.run / psycopg2），必须丢线程池，
+    # 否则会卡住整个 event loop（所有并发会话一起卡）
     phenom_names = [m["name"] for m in matched]
-    candidates = query_causes_by_phenomena(phenom_names)
+    if not state.business_line:
+        # 拿不到业务线 → 不做过滤，另一条线的根因会一起进候选。留痕是为了
+        # 定位哪条入口没把 scope 传下来（入口补齐后这条日志应当消失）
+        logger.warning("[TRIAGE] 节点③ business_line 为空，跨业务线候选未过滤")
+    candidates = await asyncio.to_thread(
+        query_causes_by_phenomena, phenom_names, state.business_line
+    )
     logger.info(f"[TRIAGE] 节点③ matched_phenomena={phenom_names} neo4j_candidates={len(candidates)}")
 
     if candidates:
-        candidates = enrich_cause_details(candidates)
-
-        if state.dtc_codes:
-            for c in candidates:
-                pass  # dtc matching is handled in graph_queries.enrich_cause_details
+        candidates = await asyncio.to_thread(enrich_cause_details, candidates)
 
         candidates = apply_context_weights(
             candidates, state.dtc_codes, state.denied_phenomena,
@@ -350,6 +368,7 @@ async def node_parse_answer(state: TriageState, deps: TriageDeps) -> dict:
         phenom_evidence_updates = {p: EVIDENCE_GRADE_CONFIRMED for p in parsed.get("confirmed", [])}
         dtc_evidence_updates = {d: EVIDENCE_GRADE_REPORTED for d in parsed.get("dtc_codes", [])}
     except Exception:
+        logger.warning(f"[TRIAGE] 节点⑤ LLM JSON 解析失败，沿用上一轮状态")
         new_confirmed = state.confirmed_phenomena
         new_denied = state.denied_phenomena
         new_dtc = state.dtc_codes
@@ -435,24 +454,25 @@ async def node_save_record(state: TriageState, deps: TriageDeps) -> dict:
     top1 = candidates[0]
     confidence = top1.confidence
 
-    async for db in deps.db_session_factory():
-        try:
-            await save_triage_result(db, {
-                "issue_id": state.issue_id,
-                "session_id": state.session_id,
-                "raw_input": state.messages[0].content if state.messages else "",
-                "confirmed_phenomena": state.confirmed_phenomena,
-                "denied_phenomena": state.denied_phenomena,
-                "candidate_causes": candidates,
-                "primary_cause_code": top1.code,
-                "primary_confidence": confidence,
-                "suggest_domain_id": None,
-                "total_rounds": state.round + 1,
-                "force_conclude": state.force_conclude,
-            })
-            break
-        finally:
-            break
+    async with deps.db_session_factory() as db:
+        # session_scope 退出时 commit —— 结果真正落库
+        await save_triage_result(db, {
+            "issue_id": state.issue_id,
+            "session_id": state.session_id,
+            "user_id": state.user_id,
+            # 业务线：状态里没有就用根因编码前缀推导（customer 会话的常态 ——
+            # 他们没有所属线，且诊断常发生在建单之前，拿不到单子的权威归属）
+            "business_line": resolve_business_line(state.business_line, top1.code),
+            "raw_input": state.messages[0].content if state.messages else "",
+            "confirmed_phenomena": state.confirmed_phenomena,
+            "denied_phenomena": state.denied_phenomena,
+            "candidate_causes": candidates,
+            "primary_cause_code": top1.code,
+            "primary_confidence": confidence,
+            "suggest_domain_id": None,
+            "total_rounds": state.round + 1,
+            "force_conclude": state.force_conclude,
+        })
 
     logger.info(f"[TRIAGE] 节点⑦ save_record done cause={top1.code} confidence={confidence:.0%}")
     return {"phase": TriagePhase.END}
@@ -578,6 +598,8 @@ async def run_triage(
     deps: TriageDeps,
     existing_state: TriageState | None = None,
     viewer_role: str = "customer",
+    business_line: str = "",
+    user_id: str = "",
 ) -> tuple[str, TriageState]:
     """
     执行一轮分诊对话。
@@ -588,28 +610,42 @@ async def run_triage(
         deps: 依赖注入容器
         existing_state: 上一轮的状态（多轮对话时传入）
         viewer_role: 查看结论的人的角色（engineer/business/aftersales/customer），影响输出格式
+        business_line: 业务线（数据作用域）。非空时现象词表、现象匹配、候选根因
+            查询都限定在该线内；留空则不过滤（兼容拿不到 scope 的入口，会打警告）
+        user_id: 诊断发起人（users.id）。落进 ai_triage_results.user_id，
+            支撑「我上次的诊断」检索与反馈所有权校验；空 = 无发起人（自动分诊）
 
     Returns:
         (assistant_reply, new_state)
     """
-    vocabulary = await load_phenomenon_vocabulary()
+    vocabulary = await load_phenomenon_vocabulary(business_line)
 
     if existing_state is None:
         state = TriageState(
             session_id=thread_id,
             phenomenon_vocabulary=vocabulary,
             viewer_role=viewer_role,
+            business_line=business_line,
+            user_id=user_id,
         )
     else:
         state = existing_state.model_copy()
         state.round = existing_state.round + 1
         state.phase = TriagePhase.EXTRACT
+        # 多轮：沿用已有 scope，但入口补上了就以入口为准（如中途关联了问题单）
+        state.business_line = business_line or state.business_line
+        state.user_id = user_id or state.user_id
         state.phenomenon_vocabulary = vocabulary
         state.viewer_role = viewer_role
 
     state.messages.append(HumanMessage(content=user_message))
 
-    graph = build_triage_graph(deps)
+    # 图的编译结果缓存到 deps（闭包绑定同一 deps，复用安全）。
+    # 之前每条消息重新 compile 一遍整张图，纯浪费。
+    graph = deps.graph_cache.get("compiled")
+    if graph is None:
+        graph = build_triage_graph(deps)
+        deps.graph_cache["compiled"] = graph
     config = {"configurable": {"thread_id": thread_id}}
     result_dict = await graph.ainvoke(state, config=config)
     result = TriageState(**result_dict)
@@ -630,8 +666,11 @@ async def run_triage(
     return reply, result
 
 
-async def load_phenomenon_vocabulary() -> str:
-    """从 DB 加载现象码词汇表（供 LLM prompt 注入）。"""
+async def load_phenomenon_vocabulary(business_line: str = "") -> str:
+    """从 DB 加载现象码词汇表（供 LLM prompt 注入）。
+
+    business_line 非空时只注入该线的词表 —— 现象名跨线共享，混着给会让
+    LLM 把故障归一化到另一条线的现象上。"""
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent))
@@ -640,7 +679,7 @@ async def load_phenomenon_vocabulary() -> str:
     lines = []
     async with AsyncSessionLocal() as db:
         from src.agents.triage.db_queries import get_all_phenomena
-        phenomena = await get_all_phenomena(db)
+        phenomena = await get_all_phenomena(db, business_line)
         for p in phenomena:
             parts = [p["name"]]
             if p.get("colloquial"):

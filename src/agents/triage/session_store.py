@@ -73,11 +73,18 @@ class TriageSessionStore:
         raw = await self.redis.get(self._key(thread_id))
         if not raw:
             return None
-        data = json.loads(raw)
-        return TriageProgress(
-            state=TriageState.model_validate_json(data["state"]),
-            reply=data.get("reply", ""),
-        )
+        try:
+            data = json.loads(raw)
+            return TriageProgress(
+                state=TriageState.model_validate_json(data["state"]),
+                reply=data.get("reply", ""),
+            )
+        except Exception as e:
+            # Redis 里的数据损坏 / 版本不兼容：按无会话处理并清掉脏数据，
+            # 让本轮按全新诊断重启（可自愈），而不是让工具直接崩掉
+            logger.warning(f"[TRIAGE-STORE] 数据损坏，重置会话 thread={thread_id}: {e}")
+            await self.clear(thread_id)
+            return None
 
     async def clear(self, thread_id: str) -> None:
         await self.redis.delete(self._key(thread_id))

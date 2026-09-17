@@ -75,10 +75,15 @@ class DedupMatcher:
         return await self._match(source, issue_id)
 
     async def detect_by_text(
-        self, description: str, dtc_codes: str = "", business_line: str = "ia",
+        self, description: str, dtc_codes: str = "", business_line: str = "",
         model_code: str = "", sw_version: str = "",
     ) -> DedupResult:
-        """根据文本描述搜索重复问题（无需 issue_id）。"""
+        """根据文本描述搜索重复问题（无需 issue_id）。
+
+        ★ business_line 无默认值：曾经默认 "ia" 导致对话入口无论用户在
+          哪条线，都只在 ia 的切片里召回。留空 = 跨线检索（调用方拿不到
+          scope 时），此时精度由门槛二（车型+版本 / DTC 重叠）兜住。
+        """
         source = {
             "id": 0,
             "title": description,
@@ -103,12 +108,15 @@ class DedupMatcher:
         source_sw = source.get("sw_version", "")
 
         try:
-            source_emb = self.embedding_model.embed_query(source_text)
+            # embed_query 是同步 HTTP 调用，丢线程池避免阻塞 event loop
+            source_emb = await asyncio.to_thread(self.embedding_model.embed_query, source_text)
         except Exception:
             logger.warning(f"[DEDUP] embedding failed for source_id={source_id}")
             return result
 
         # ── 门槛一：向量相似召回 ──
+        # business_line 留空 = 不过滤（跨线召回），不再兜底成某条固定线
+        scope = source.get("business_line", "") or ""
         candidates: list[dict] = []
         try:
             from src.agents.dedup import vector_index
@@ -116,7 +124,7 @@ class DedupMatcher:
             hits = await asyncio.to_thread(
                 vector_index.search_similar,
                 source_emb,
-                source.get("business_line", "") or "ia",
+                scope,
                 exclude_id=source_id or None,
             )
             logger.info(f"[DEDUP] milvus recall: {len(hits)} hits")
@@ -201,7 +209,7 @@ class DedupMatcher:
 
         返回的候选带 _similarity 字段，与 Milvus 路径同构。"""
         candidates = await self._load_candidates_full(
-            source.get("business_line", "") or "ia", exclude_id=source_id
+            source.get("business_line", "") or "", exclude_id=source_id
         )
         logger.info(f"[DEDUP] bruteforce candidates loaded: {len(candidates)}")
 
@@ -220,120 +228,147 @@ class DedupMatcher:
                 scored.append(dict(cand, _similarity=sim))
         return scored
 
+    # ── PG 访问：psycopg2 是同步驱动，async 入口一律 asyncio.to_thread 包装，
+    #    连接在 finally 里关闭，避免异常路径泄漏连接 ──
+
+    @staticmethod
+    def _pg_connect():
+        import psycopg2
+
+        from src.infra.pg_scope import apply_scope
+
+        conn = psycopg2.connect(
+            host=settings.DB_HOST, port=settings.DB_PORT,
+            user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
+        )
+        # ★ 裸连接必须先带上作用域，否则 RLS 开启后这些查询静默返回空
+        apply_scope(conn)
+        return conn
+
     async def _save_dedup_links(self, source_id: int, matches: list[DedupMatch]) -> None:
         """将去重结果写入 ai_dedup_links 影子表。"""
-        import psycopg2
+        def _sync():
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                for m in matches:
+                    cur.execute(
+                        "INSERT INTO ai_dedup_links (source_issue_id, matched_issue_id, similarity, evidence, is_duplicate) "
+                        "VALUES (%s, %s, %s, %s, %s) "
+                        "ON CONFLICT (source_issue_id, matched_issue_id) DO UPDATE SET "
+                        "similarity = EXCLUDED.similarity, evidence = EXCLUDED.evidence, "
+                        "is_duplicate = EXCLUDED.is_duplicate, updated_at = NOW()",
+                        (source_id, m.issue_id, m.similarity, m.evidence, True),
+                    )
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
+
         try:
-            conn = psycopg2.connect(
-                host=settings.DB_HOST, port=settings.DB_PORT,
-                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
-            )
-            cur = conn.cursor()
-            for m in matches:
-                cur.execute(
-                    "INSERT INTO ai_dedup_links (source_issue_id, matched_issue_id, similarity, evidence, is_duplicate) "
-                    "VALUES (%s, %s, %s, %s, %s) "
-                    "ON CONFLICT (source_issue_id, matched_issue_id) DO UPDATE SET "
-                    "similarity = EXCLUDED.similarity, evidence = EXCLUDED.evidence, "
-                    "is_duplicate = EXCLUDED.is_duplicate, updated_at = NOW()",
-                    (source_id, m.issue_id, m.similarity, m.evidence, True),
-                )
-            conn.commit()
-            cur.close(); conn.close()
-        except Exception:
-            pass  # 写回失败不影响主流程
+            await asyncio.to_thread(_sync)
+        except Exception as e:
+            logger.warning(f"[DEDUP] 写入 ai_dedup_links 失败 source_id={source_id}: {e}")  # 写回失败不影响主流程
 
     async def _load_issue_full(self, issue_id: int) -> dict | None:
-        import psycopg2
+        def _sync():
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                    "sw_version, business_line FROM alm_issues WHERE id = %s",
+                    (issue_id,),
+                )
+                row = cur.fetchone()
+                cur.close()
+                if not row:
+                    return None
+                return {
+                    "id": row[0], "issue_no": row[1], "title": row[2],
+                    "description": row[3] or "", "dtc_snapshot": row[4] or "",
+                    "model_code": row[5] or "", "sw_version": row[6] or "",
+                    "business_line": row[7] or "",
+                }
+            finally:
+                conn.close()
+
         try:
-            conn = psycopg2.connect(
-                host=settings.DB_HOST, port=settings.DB_PORT,
-                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
-            )
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
-                "sw_version, business_line FROM alm_issues WHERE id = %s",
-                (issue_id,),
-            )
-            row = cur.fetchone()
-            cur.close(); conn.close()
-            if not row:
-                return None
-            return {
-                "id": row[0], "issue_no": row[1], "title": row[2],
-                "description": row[3] or "", "dtc_snapshot": row[4] or "",
-                "model_code": row[5] or "", "sw_version": row[6] or "",
-                "business_line": row[7] or "",
-            }
-        except Exception:
+            return await asyncio.to_thread(_sync)
+        except Exception as e:
+            logger.warning(f"[DEDUP] 加载问题单失败 issue_id={issue_id}: {e}")
             return None
 
     async def _load_issues_by_ids(self, ids: list[int]) -> list[dict]:
         """按 Milvus 召回的 id 批量加载候选行。"""
         if not ids:
             return []
-        import psycopg2
+
+        def _sync():
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                    "sw_version, business_line FROM alm_issues WHERE id = ANY(%s) "
+                    "AND status IN ('open', 'analyzing')",
+                    (ids,),
+                )
+                rows = cur.fetchall()
+                cur.close()
+                return [
+                    {"id": r[0], "issue_no": r[1], "title": r[2],
+                     "description": r[3] or "", "dtc_snapshot": r[4] or "",
+                     "model_code": r[5] or "", "sw_version": r[6] or "",
+                     "business_line": r[7] or ""}
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+
         try:
-            conn = psycopg2.connect(
-                host=settings.DB_HOST, port=settings.DB_PORT,
-                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
-            )
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
-                "sw_version, business_line FROM alm_issues WHERE id = ANY(%s) "
-                "AND status IN ('open', 'analyzing')",
-                (ids,),
-            )
-            rows = cur.fetchall()
-            cur.close(); conn.close()
-            return [
-                {"id": r[0], "issue_no": r[1], "title": r[2],
-                 "description": r[3] or "", "dtc_snapshot": r[4] or "",
-                 "model_code": r[5] or "", "sw_version": r[6] or "",
-                 "business_line": r[7] or ""}
-                for r in rows
-            ]
-        except Exception:
+            return await asyncio.to_thread(_sync)
+        except Exception as e:
+            logger.warning(f"[DEDUP] 批量加载候选失败: {e}")
             return []
 
-    async def _load_candidates_full(self, business_line: str, exclude_id: int | None = None) -> list[dict]:
-        import psycopg2
+    async def _load_candidates_full(self, business_line: str = "", exclude_id: int | None = None) -> list[dict]:
+        """降级候选池。business_line 留空时不过滤（与 Milvus 路径同构）。"""
+        def _sync():
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                sql = (
+                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
+                    "sw_version, business_line FROM alm_issues "
+                    "WHERE status IN ('open', 'analyzing') "
+                    "AND updated_at > NOW() - INTERVAL '90 days' "
+                )
+                params: list = []
+                if business_line:
+                    sql += " AND business_line = %s"
+                    params.append(business_line)
+                if exclude_id:
+                    sql += " AND id != %s"
+                    params.append(exclude_id)
+                sql += " ORDER BY updated_at DESC LIMIT 50"
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+                cur.close()
+                return [
+                    {"id": r[0], "issue_no": r[1], "title": r[2],
+                     "description": r[3] or "", "dtc_snapshot": r[4] or "",
+                     "model_code": r[5] or "", "sw_version": r[6] or "",
+                     "business_line": r[7] or ""}
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+
         try:
-            conn = psycopg2.connect(
-                host=settings.DB_HOST, port=settings.DB_PORT,
-                user=settings.DB_USER, password=settings.DB_PASSWORD, dbname=settings.DB_NAME,
-            )
-            cur = conn.cursor()
-            if exclude_id:
-                cur.execute(
-                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
-                    "sw_version, business_line FROM alm_issues "
-                    "WHERE status IN ('open', 'analyzing') AND business_line = %s AND id != %s "
-                    "AND updated_at > NOW() - INTERVAL '90 days' "
-                    "ORDER BY updated_at DESC LIMIT 50",
-                    (business_line, exclude_id),
-                )
-            else:
-                cur.execute(
-                    "SELECT id, issue_no, title, description, dtc_snapshot, model_code, "
-                    "sw_version, business_line FROM alm_issues "
-                    "WHERE status IN ('open', 'analyzing') AND business_line = %s "
-                    "AND updated_at > NOW() - INTERVAL '90 days' "
-                    "ORDER BY updated_at DESC LIMIT 50",
-                    (business_line,),
-                )
-            rows = cur.fetchall()
-            cur.close(); conn.close()
-            return [
-                {"id": r[0], "issue_no": r[1], "title": r[2],
-                 "description": r[3] or "", "dtc_snapshot": r[4] or "",
-                 "model_code": r[5] or "", "sw_version": r[6] or "",
-                 "business_line": r[7] or ""}
-                for r in rows
-            ]
-        except Exception:
+            return await asyncio.to_thread(_sync)
+        except Exception as e:
+            logger.warning(f"[DEDUP] 加载降级候选失败: {e}")
             return []
 
 

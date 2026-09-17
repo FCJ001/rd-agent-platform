@@ -33,7 +33,7 @@ async def _load_issues(days: int, business_line: str | None) -> list[dict]:
     sql = """
         SELECT id, issue_no, business_line, title, description
         FROM alm_issues
-        WHERE updated_at > NOW() - (:days || ' days')::interval
+        WHERE updated_at > NOW() - ((:days)::int || ' days')::interval
     """
     params: dict = {"days": days}
     if business_line:

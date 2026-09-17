@@ -40,6 +40,9 @@ class TriageState(BaseModel):
     phase: TriagePhase = TriagePhase.EXTRACT
     round: int = 0
     session_id: str = ""
+    # 诊断发起人（users.id 的字符串形式）。落进 ai_triage_results.user_id，
+    # 是「我上次的诊断」这个检索维度的依据，也是反馈接口的所有权来源
+    user_id: str = ""
     issue_id: int | None = None
     # issue context (loaded from DB when issue_id is provided)
     issue_title: str = ""

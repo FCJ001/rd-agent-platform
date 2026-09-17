@@ -2,10 +2,11 @@
 # rd-agent-platform — 基础设施层
 # 包含：PostgreSQL / Redis Stack / Neo4j / Milvus(+etcd, MinIO)
 #
-# 结构照搬 tiangong-agent 的 docker-compose.yml，只改了两处：
-#   ① 容器名 / 网络名换成 rd-agent-*
-#   ② 账号密码换成 rdagent / rd_agent
-# 端口与医疗版一致 —— 两个项目不同时跑，跑之前先 docker compose down 另一个
+# 生产加固（相对开发版）：
+#   ① 所有宿主端口绑定 127.0.0.1 —— 数据服务绝不直接暴露公网，
+#      应用经 compose 网络（服务名）访问，远程访问走跳板/VPN
+#   ② 口令全部走环境变量（.env），不再硬编码弱口令
+#   ③ 全服务 restart policy + 内存上限 + 关键依赖 healthcheck 门控
 #
 # 启动：docker compose up -d
 # 停止：docker compose down
@@ -23,69 +24,74 @@ services:
     container_name: rd-agent-postgres
     restart: always
     environment:
-      POSTGRES_USER: rdagent
-      POSTGRES_PASSWORD: rdagent123
+      POSTGRES_USER: ${DB_USER:-rdagent}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?请在 .env 里设置 DB_PASSWORD}
       # ★ POSTGRES_DB 只在数据卷为空时生效。
       #   改了库名发现没生效，多半是卷里已有数据 —— 要 down -v 才会重建
-      POSTGRES_DB: rd_agent
+      POSTGRES_DB: ${DB_NAME:-rd_agent}
     volumes:
       - ./docker/postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     networks:
       - rd-agent-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rdagent -d rd_agent"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-rdagent} -d ${DB_NAME:-rd_agent}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    mem_limit: 1g
 
   # ----------------------------------------------------------
   # Redis Stack — 短期记忆 + 分诊状态机 checkpoint
   # 必须用 redis-stack 而不是标准 redis：
   #   langgraph-checkpoint-redis 依赖 JSON.SET（RedisJSON 模块）
   #   AsyncRedisSaver 还要建 RediSearch 索引
-  # Web UI（RedisInsight）：http://localhost:8001
+  # RedisInsight（绑定 127.0.0.1）：http://localhost:8001
   # ----------------------------------------------------------
   redis:
     image: redis/redis-stack:7.4.0-v3
     container_name: rd-agent-redis
     restart: always
     environment:
-      REDIS_ARGS: "--appendonly yes"
+      REDIS_ARGS: "--appendonly yes --requirepass ${REDIS_PASSWORD:?请在 .env 里设置 REDIS_PASSWORD}"
+      # 透传给容器内健康检查用（REDIS_ARGS 只影响服务端配置）
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - ./docker/redis_data:/data
     ports:
-      - "6379:6379"   # Redis 主端口
-      - "8001:8001"   # RedisInsight 可视化 Web UI
+      - "127.0.0.1:6379:6379"   # Redis 主端口
+      - "127.0.0.1:8001:8001"   # RedisInsight 可视化 Web UI
     networks:
       - rd-agent-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # requirepass 之后 ping 要带密码
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
+    mem_limit: 1g
 
   # ----------------------------------------------------------
   # Neo4j — 图数据库
   # 存储：追溯图谱（现象码-根因-责任域-配置项-变更-基线，7 类关系）
   # 「冻结基线阻塞哪些在途需求」这条五跳查询靠它
-  # Web UI：http://localhost:7474   neo4j / rdagent123
+  # Web UI（绑定 127.0.0.1）：http://localhost:7474
   # ----------------------------------------------------------
   neo4j:
     image: neo4j:5.20
     container_name: rd-agent-neo4j
     restart: always
     environment:
-      NEO4J_AUTH: neo4j/rdagent123
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?请在 .env 里设置 NEO4J_PASSWORD}
       NEO4J_PLUGINS: '["apoc"]'                  # APOC 插件，支持高级图算法
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
     volumes:
       - ./docker/neo4j_data:/data
       - ./docker/neo4j_logs:/logs
     ports:
-      - "7474:7474"   # Web UI
-      - "7687:7687"   # Bolt 协议（SDK 连接）
+      - "127.0.0.1:7474:7474"   # Web UI
+      - "127.0.0.1:7687:7687"   # Bolt 协议（SDK 连接）
     networks:
       - rd-agent-net
     healthcheck:
@@ -93,6 +99,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+    mem_limit: 1g
 
   # ----------------------------------------------------------
   # Milvus 依赖：etcd — 元数据存储
@@ -101,6 +108,7 @@ services:
   etcd:
     container_name: rd-agent-milvus-etcd
     image: quay.io/coreos/etcd:v3.5.25
+    restart: always
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
       - ETCD_AUTO_COMPACTION_RETENTION=1000
@@ -115,26 +123,27 @@ services:
       - ./docker/etcd_data:/etcd
     networks:
       - rd-agent-net
+    mem_limit: 512m
 
   # ----------------------------------------------------------
   # MinIO — 对象存储
   # 双重用途：① Milvus 的向量数据文件后端
   #           ② 报告/日志附件（台架、绝缘、SOH 报告原件）
-  # Console：http://localhost:9001
+  # Console（绑定 127.0.0.1）：http://localhost:9001
   # ----------------------------------------------------------
   minio:
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     container_name: rd-agent-minio
     restart: always
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?请在 .env 里设置 MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?请在 .env 里设置 MINIO_SECRET_KEY}
     command: minio server /minio_data --console-address ":9001"
     volumes:
       - ./docker/minio_data:/minio_data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     networks:
       - rd-agent-net
     healthcheck:
@@ -142,6 +151,7 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    mem_limit: 512m
 
   # ----------------------------------------------------------
   # Milvus — 向量数据库
@@ -150,6 +160,7 @@ services:
   milvus:
     container_name: rd-agent-milvus
     image: milvusdb/milvus:v2.6.13
+    restart: always
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
@@ -161,11 +172,13 @@ services:
     volumes:
       - ./docker/milvus_data:/var/lib/milvus
     ports:
-      - "19530:19530"   # gRPC 接口（SDK 连接）
-      - "9091:9091"     # HTTP 接口（健康检查）
+      - "127.0.0.1:19530:19530"   # gRPC 接口（SDK 连接）
+      - "127.0.0.1:9091:9091"     # HTTP 接口（健康检查）
     depends_on:
-      - etcd
-      - minio
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_healthy
     networks:
       - rd-agent-net
     healthcheck:
@@ -173,22 +186,26 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    mem_limit: 2g
 
   # ----------------------------------------------------------
-  # Attu — Milvus 可视化客户端
+  # Attu — Milvus 可视化客户端（绑定 127.0.0.1）
   # http://localhost:3000
   # ----------------------------------------------------------
   attu:
     container_name: rd-agent-attu
-    image: zilliz/attu:latest
+    image: zilliz/attu:v2.6
+    restart: always
     environment:
       MILVUS_URL: milvus:19530
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     networks:
       - rd-agent-net
     depends_on:
-      - milvus
+      milvus:
+        condition: service_healthy
+    mem_limit: 512m
 
 # ----------------------------------------------------------
 # 网络

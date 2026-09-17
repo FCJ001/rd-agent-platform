@@ -22,15 +22,25 @@ async def load_issue_context(db: AsyncSession, issue_id: int) -> dict | None:
         "issue_desc": mask_free_text(issue.description) or "",
         "issue_dtc_snapshot": issue.dtc_snapshot or "",
         "source": issue.source or "customer",
+        # 问题单上的业务线是这件事的权威归属 —— 分诊带上它才能把现象词表、
+        # 候选根因都限定在同一条线内
+        "business_line": issue.business_line or "",
     }
 
 
-async def get_all_phenomena(db: AsyncSession) -> list[dict]:
-    """获取全部现象码（供 LLM prompt 注入）。"""
-    result = await db.execute(
-        select(Phenomenon.id, Phenomenon.name, Phenomenon.code, Phenomenon.colloquial, Phenomenon.business_line)
-        .order_by(Phenomenon.id)
+async def get_all_phenomena(db: AsyncSession, business_line: str = "") -> list[dict]:
+    """获取现象码（供 LLM prompt 注入）。
+
+    ★ business_line 非空时只给该线的词表。现象名跨线共享，混着给会让
+      LLM 把故障归一化到另一条线的现象上。
+    """
+    stmt = select(
+        Phenomenon.id, Phenomenon.name, Phenomenon.code,
+        Phenomenon.colloquial, Phenomenon.business_line,
     )
+    if business_line:
+        stmt = stmt.where(Phenomenon.business_line == business_line)
+    result = await db.execute(stmt.order_by(Phenomenon.id))
     rows = result.all()
     return [
         {"id": r.id, "name": r.name, "code": r.code, "colloquial": r.colloquial, "business_line": r.business_line}
@@ -38,14 +48,22 @@ async def get_all_phenomena(db: AsyncSession) -> list[dict]:
     ]
 
 
-async def match_phenomena_by_names(db: AsyncSession, names: list[str]) -> list[dict]:
-    """精确匹配现象名 → 返回现象 id/code/name。"""
+async def match_phenomena_by_names(
+    db: AsyncSession, names: list[str], business_line: str = "",
+) -> list[dict]:
+    """精确匹配现象名 → 返回现象 id/code/name。
+
+    ★ 现象名在 PG 里是 (business_line, name) 复合唯一 —— 同名跨线各一行。
+      business_line 非空时只取本线的行，否则同一个名字会返回两条（分属两线）。
+    """
     if not names:
         return []
-    result = await db.execute(
-        select(Phenomenon.id, Phenomenon.name, Phenomenon.code, Phenomenon.business_line)
-        .where(Phenomenon.name.in_(names))
-    )
+    stmt = select(
+        Phenomenon.id, Phenomenon.name, Phenomenon.code, Phenomenon.business_line,
+    ).where(Phenomenon.name.in_(names))
+    if business_line:
+        stmt = stmt.where(Phenomenon.business_line == business_line)
+    result = await db.execute(stmt)
     rows = result.all()
     return [{"id": r.id, "name": r.name, "code": r.code, "business_line": r.business_line} for r in rows]
 
@@ -100,20 +118,6 @@ async def save_triage_result(db: AsyncSession, result: dict) -> int:
     import json
     from sqlalchemy import text as sa_text
 
-    sql = sa_text("""
-        INSERT INTO ai_triage_results
-            (source_issue_id, session_id, raw_input,
-             confirmed_phenomena, denied_phenomena,
-             candidate_causes, primary_cause_code, primary_confidence,
-             suggest_domain_id, total_rounds, force_conclude)
-        VALUES
-            (:source_issue_id, :session_id, :raw_input,
-             :confirmed_phenomena, :denied_phenomena,
-             :candidate_causes, :primary_cause_code, :primary_confidence,
-             :suggest_domain_id, :total_rounds, :force_conclude)
-        RETURNING id
-    """)
-
     candidate_causes_json = json.dumps([
         c.model_dump() if hasattr(c, 'model_dump') else c
         for c in result.get("candidate_causes", [])
@@ -122,6 +126,10 @@ async def save_triage_result(db: AsyncSession, result: dict) -> int:
     params = {
         "source_issue_id": result.get("issue_id"),
         "session_id": result.get("session_id", ""),
+        # 归属与作用域：空值一律落 NULL（不是空串）—— 检索侧对 NULL 的
+        # fail-closed 语义就是靠这个区分的
+        "user_id": int(result["user_id"]) if result.get("user_id") else None,
+        "business_line": result.get("business_line") or None,
         "raw_input": result.get("raw_input", ""),
         "confirmed_phenomena": json.dumps(result.get("confirmed_phenomena", []), ensure_ascii=False),
         "denied_phenomena": json.dumps(result.get("denied_phenomena", []), ensure_ascii=False),
@@ -140,12 +148,14 @@ async def save_triage_result(db: AsyncSession, result: dict) -> int:
     await db.execute(
         sa_text("""
             INSERT INTO ai_triage_results
-                (id, source_issue_id, session_id, raw_input,
+                (id, source_issue_id, user_id, business_line,
+                 session_id, raw_input,
                  confirmed_phenomena, denied_phenomena,
                  candidate_causes, primary_cause_code, primary_confidence,
                  suggest_domain_id, total_rounds, force_conclude)
             VALUES
-                (:id_val, :source_issue_id, :session_id, :raw_input,
+                (:id_val, :source_issue_id, :user_id, :business_line,
+                 :session_id, :raw_input,
                  :confirmed_phenomena, :denied_phenomena,
                  :candidate_causes, :primary_cause_code, :primary_confidence,
                  :suggest_domain_id, :total_rounds, :force_conclude)

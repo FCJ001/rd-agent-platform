@@ -1,25 +1,38 @@
-"""Neo4j Cypher 查询函数。参考天宫医疗版 neo4j_queries.py。"""
+"""Neo4j Cypher 查询函数。参考天宫医疗版 neo4j_queries.py。
 
+★ 本模块全是同步调用（neo4j sync driver / psycopg2）。
+  从 async 节点调用时必须 `asyncio.to_thread(...)` 包装（见 graph.py 节点③）。
+"""
+
+from src.core.logger import logger
 from src.agents.triage.state import CandidateCause
 from src.infra.neo4j_client import get_neo4j_driver
 
 
 def query_causes_by_phenomena(
     phenomenon_names: list[str],
+    business_line: str = "",
     top_k: int = 10,
 ) -> list[CandidateCause]:
     """
     根据已确认现象名，从 Neo4j 查询候选根因。
     按基础置信度（命中现象数 / 该根因总现象数）降序，取 Top K。
+
+    ★ business_line 非空时按业务线过滤候选根因。现象节点在 Neo4j 里是
+      (business_line, name) 复合键 —— 同一个现象名在两条线各有节点，
+      不过滤会把另一条线的根因一起捞出来（且窄根因因分母小反而排更前）。
+      留空 = 不做过滤（调用方拿不到业务线时的兼容路径，会打日志）。
     """
     if not phenomenon_names:
         return []
 
     driver = get_neo4j_driver()
 
-    cypher = """
+    # 谓词按需拼接（值始终走参数绑定，不拼进语句文本）
+    line_predicate = "AND rc.business_line = $business_line" if business_line else ""
+    cypher = f"""
     MATCH (rc:RootCause)-[r:INDICATES]->(ph:Phenomenon)
-    WHERE ph.name IN $phenom_names
+    WHERE ph.name IN $phenom_names {line_predicate}
     WITH rc, collect(ph.name) AS matched_phenomena, count(ph) AS matched_count
     MATCH (rc)-[:INDICATES]->(all_ph:Phenomenon)
     WITH rc, matched_phenomena, matched_count, count(all_ph) AS total_count
@@ -40,7 +53,12 @@ def query_causes_by_phenomena(
     """
 
     with driver.session() as session:
-        result = session.run(cypher, phenom_names=phenomenon_names, top_k=top_k)
+        result = session.run(
+            cypher,
+            phenom_names=phenomenon_names,
+            business_line=business_line,
+            top_k=top_k,
+        )
         records = [record.data() for record in result]
 
     candidates = []
@@ -128,25 +146,30 @@ def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCaus
     try:
         import psycopg2
         from src.core.config import get_settings
+        from src.infra.pg_scope import apply_scope
         s = get_settings()
         conn = psycopg2.connect(
             host=s.DB_HOST, port=s.DB_PORT,
             user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
         )
-        cur = conn.cursor()
-        placeholders = ",".join(["%s"] * len(cause_codes))
-        cur.execute(
-            f"SELECT code, verify_items FROM root_causes WHERE code IN ({placeholders})",
-            cause_codes,
-        )
-        rows = {r[0]: r[1] for r in cur.fetchall()}
-        cur.close()
-        conn.close()
+        # root_causes 受 RLS 管控：不带作用域会静默查空（verify_items 消失）
+        apply_scope(conn)
+        try:
+            cur = conn.cursor()
+            placeholders = ",".join(["%s"] * len(cause_codes))
+            cur.execute(
+                f"SELECT code, verify_items FROM root_causes WHERE code IN ({placeholders})",
+                cause_codes,
+            )
+            rows = {r[0]: r[1] for r in cur.fetchall()}
+            cur.close()
+        finally:
+            conn.close()
         for c in candidates:
             if c.code in rows:
                 c.verify_items = rows[c.code] or ""
-    except Exception:
-        pass  # verify_items is optional enrichment
+    except Exception as e:
+        logger.warning(f"[GRAPH-QUERIES] verify_items 富化失败（可选项）: {e}")
 
     # Load LOCATED_IN relationships from Neo4j
     try:

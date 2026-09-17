@@ -24,18 +24,31 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 
 
-def _upsert(cur, table: str, key_col: str, key_val, data: dict) -> bool:
-    """返回 True 表示有插入/更新，False 表示跳过"""
+def _upsert(cur, table: str, key_col, key_val, data: dict) -> bool:
+    """返回 True 表示有插入/更新，False 表示跳过
+
+    key_col 可以是单列名，也可以是列名列表（复合唯一键）；复合时 key_val 是
+    与之一一对应的元组 —— 现象表就是这种：(business_line, name)。
+    """
+    key_cols = [key_col] if isinstance(key_col, str) else list(key_col)
+    key_vals = (key_val,) if isinstance(key_col, str) else tuple(key_val)
+
     columns = list(data.keys())
-    if key_col not in columns:
-        columns.append(key_col)
-        data[key_col] = key_val
+    for col, val in zip(key_cols, key_vals):
+        if col not in columns:
+            columns.append(col)
+            data[col] = val
     placeholders = [f"%({c})s" for c in columns]
-    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c != key_col)
+    updates = [c for c in columns if c not in key_cols]
+    conflict = ", ".join(key_cols)
+    tail = (
+        "DO UPDATE SET " + ", ".join(f"{c} = EXCLUDED.{c}" for c in updates)
+        if updates else "DO NOTHING"  # 全列都是键 → 没有可更新的列
+    )
     sql = (
         f"INSERT INTO {table} ({', '.join(columns)}) "
         f"VALUES ({', '.join(placeholders)}) "
-        f"ON CONFLICT ({key_col}) DO UPDATE SET {set_clause}"
+        f"ON CONFLICT ({conflict}) {tail}"
     )
     cur.execute(sql, data)
     return cur.rowcount > 0
@@ -70,7 +83,7 @@ def seed():
 
     # ============ 1. 诊断图谱 (alm_kg.json) ============
     kg_path = DATA_DIR / "alm_kg.json"
-    phenom_to_id: dict[str, int] = {}
+    phenom_to_id: dict[tuple[str, str], int] = {}
     cause_to_id: dict[str, int] = {}
 
     if kg_path.exists():
@@ -99,21 +112,27 @@ def seed():
         conn.commit()
 
         # 1b. Phenomena
-        seen_phenomena: set[str] = set()
+        # ★ 唯一键是 (business_line, name)：现象名是跨业务线共享的词汇表
+        #   （实测 26 个名有 13 个跨线），只按 name 去重会把两条线的现象
+        #   塌成一行，business_line / code 被后写入者覆盖。
+        seen_phenomena: set[tuple[str, str]] = set()
         for c in causes:
+            line = c.get("business_line", "ev")
             for p in c.get("phenomena", []):
-                if p in seen_phenomena:
+                if (line, p) in seen_phenomena:
                     continue
-                seen_phenomena.add(p)
-                _upsert(cur, "phenomena", "name", p, {
-                    "code": f"PH-{c.get('business_line', 'EV').upper()}-{len(phenom_to_id)+1:03d}",
-                    "business_line": c.get("business_line", "ev"),
+                seen_phenomena.add((line, p))
+                _upsert(cur, "phenomena", ["business_line", "name"], (line, p), {
+                    "code": f"PH-{line.upper()}-{len(seen_phenomena):03d}",
                     "colloquial": p,
                 })
-                cur.execute("SELECT id FROM phenomena WHERE name = %s", (p,))
+                cur.execute(
+                    "SELECT id FROM phenomena WHERE name = %s AND business_line = %s",
+                    (p, line),
+                )
                 row = cur.fetchone()
                 if row:
-                    phenom_to_id[p] = row[0]
+                    phenom_to_id[(line, p)] = row[0]
         conn.commit()
 
         # 1c. CausePhenomenon (多对多)
@@ -121,8 +140,9 @@ def seed():
             cause_id = cause_to_id.get(c["code"])
             if not cause_id:
                 continue
+            line = c.get("business_line", "ev")
             for pm in c.get("phenomena_meta", []):
-                phenom_id = phenom_to_id.get(pm["name"])
+                phenom_id = phenom_to_id.get((line, pm["name"]))
                 if not phenom_id:
                     continue
                 cur.execute(
@@ -214,21 +234,24 @@ def seed():
     # ============ 3. DTC 故障码（简版，从 KG 里提取）============
     if kg_path.exists():
         causes = [json.loads(line) for line in kg_path.read_text(encoding="utf-8").strip().split("\n") if line]
-        seen_dtc: set[str] = set()
+        # ★ 去重键是 (business_line, code)，不是 code：DTC 码同样跨线共享
+        #   （实测 U0155 在 ev / ia 都出现）。按 code 单键去重会漏掉后一条线，
+        #   而唯一约束也早已改成 (business_line, code) —— 用 code 做冲突目标
+        #   会直接报 "no unique or exclusion constraint matching"。
+        seen_dtc: set[tuple[str, str]] = set()
         for c in causes:
+            line = c.get("business_line", "ev")
             for dtc in c.get("dtc", []):
-                if dtc in seen_dtc:
+                if (line, dtc) in seen_dtc:
                     continue
-                seen_dtc.add(dtc)
-                line = c.get("business_line", "ev")
-                _upsert(cur, "dtc_codes", "code", dtc, {
+                seen_dtc.add((line, dtc))
+                _upsert(cur, "dtc_codes", ["business_line", "code"], (line, dtc), {
                     "system": "powertrain" if line == "ev" else "network",
                     "description_zh": dtc,
-                    "business_line": line,
                 })
         conn.commit()
         if seen_dtc:
-            logger.info(f"DTC 故障码: {len(seen_dtc)}")
+            logger.info(f"DTC 故障码: {len(seen_dtc)}（按业务线分别计数）")
 
     cur.close()
     conn.close()

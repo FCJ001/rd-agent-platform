@@ -8,7 +8,7 @@ from src.agents.triage.graph import (
     TriageDeps, run_triage, _get_llm_json, _get_llm_chat,
 )
 from src.core.config import get_settings
-from src.infra.db import AsyncSessionLocal
+from src.infra.db import session_scope
 
 settings = get_settings()
 
@@ -21,10 +21,8 @@ class TriageAgent:
         self.llm_chat = _get_llm_chat()
 
     def _build_deps(self) -> TriageDeps:
-        async def _db_factory():
-            async with AsyncSessionLocal() as session:
-                yield session
-        return TriageDeps(llm_json=self.llm_json, llm_chat=self.llm_chat, db_session_factory=_db_factory)
+        # session_scope：节点写库（save_triage_result 等）退出时真正 commit
+        return TriageDeps(llm_json=self.llm_json, llm_chat=self.llm_chat, db_session_factory=session_scope)
 
     async def diagnose(
         self,
@@ -32,6 +30,8 @@ class TriageAgent:
         session_id: str | None = None,
         issue_id: int | None = None,
         existing_state: TriageState | dict | None = None,
+        business_line: str = "",
+        user_id: str = "",
     ) -> dict:
         """
         执行一轮分诊诊断。
@@ -42,6 +42,8 @@ class TriageAgent:
             issue_id: 关联问题单 ID
             existing_state: 上一轮的 TriageState（对象或其序列化 dict，
                 多轮时由调用方经 TriageSessionStore 取出传入）
+            business_line: 数据作用域（业务线）。非空时现象词表与候选根因
+                限定在该线内；留空则不过滤。传了 issue_id 时以问题单归属为准
 
         Returns:
             dict with keys: session_id, status, round, normalized_phenomena,
@@ -64,6 +66,8 @@ class TriageAgent:
             thread_id=sid,
             deps=deps,
             existing_state=prev_state,
+            business_line=business_line,
+            user_id=user_id,
         )
 
         # Marshal candidates to dicts
