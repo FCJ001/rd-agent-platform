@@ -88,10 +88,12 @@ def upsert_issues(issues: list[dict]) -> int:
 
     vectors = embed_model.embed_documents(texts)
     collection = _get_collection()
-    # Milvus 布尔表达式的字符串字面量要双引号，不能用 Python list repr（单引号）
-    ids_expr = 'id in ["' + '", "'.join(r["id"] for r in rows) + '"]'
-    collection.delete(expr=ids_expr)
-    collection.insert([{
+    # ★ 用 Milvus 原生 upsert，而不是「先按 id 删除、再 insert」：后者是两个
+    #   客户端操作，同一 issue 的两条事件并发时（webhook 镜像 → 后台任务）
+    #   会互相删掉对方刚插的行，或在两次调用之间留下一段「按 id 查不到」的空窗
+    #   —— 恰好落在这段空窗里的去重检索会降级成「没发现重复」。
+    #   Milvus 内部实现仍是 delete+insert，但客户端侧不再有可交错的窗口。
+    collection.upsert([{
         "id": r["id"],
         "issue_no": r["issue_no"],
         "business_line": r["business_line"],

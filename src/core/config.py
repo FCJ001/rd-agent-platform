@@ -92,6 +92,18 @@ class Settings(BaseSettings):
     # 默认 7 天 + 读时续期，覆盖「用户隔很久才回答追问」的场景
     CHECKPOINTER_TTL_MINUTES: int = 7 * 24 * 60
 
+    # ---------------- 分诊进度存储 ----------------
+    # triage_state:{thread_id} 的 TTL（秒）。
+    # ★ 必须严格大于 CHECKPOINTER_TTL_MINUTES：两者是「同一段追问历史」的两个
+    #   副本，进度先过期而挂起的 interrupt 还活着时，resume 重放会让工具读不到
+    #   进度、误判成首轮重跑 —— 既白烧一整轮模型调用，又把 checkpointer 里
+    #   记录的历史回答当成本轮新输入重新处理一遍，追问序列与 round 从此错位
+    #   （实测轨迹见 tests/test_session_store_ttl.py）。
+    #   两边都在读时续期（checkpointer 是 refresh_on_read；store 见 load()），
+    #   所以只要 TTL 更大就能保证「interrupt 活着时进度一定还在」。
+    #   代价只是多留一个 Redis key，取 checkpointer TTL + 1 天余量。
+    TRIAGE_STATE_TTL_SECONDS: int = 8 * 24 * 3600
+
     # ---------------- 分诊会话锁 ----------------
     # Redis 分布式锁 TTL（秒）。★ 不是「用户思考时长」——interrupt() 抛异常时
     # 锁就已释放，真实持有时长 = 两次 interrupt 之间的 LLM 调用（秒~十几秒）。
@@ -104,6 +116,53 @@ class Settings(BaseSettings):
     # 跨进程的长任务则靠这个上限快速失败，不会无限等。
     TRIAGE_LOCK_RETRY_TIMES: int = 3
     TRIAGE_LOCK_RETRY_INTERVAL_SECONDS: float = 0.5
+
+    # ---------------- chat 回合锁 ----------------
+    # 保护 Supervisor checkpointer 里该会话的消息历史（chat_lock:{thread_id}）。
+    # ★ 与会话锁是两个命名空间而非重复：两者覆盖的资源不同（控制面 vs 数据面），
+    #   合并成一把会在「chat 回合内调用分诊工具」时自锁（见 lock.py 头注释）。
+    # TTL 取得比会话锁小得多，因为持有时长 = 本回合全部工具调用（可能好几分钟）
+    # —— 靠续租兜正常慢任务，TTL 只负责「进程崩溃后多久自动解锁」。
+    # 取 90s 与闸门租约同量级，续租周期 30s 给 Redis 抖动留两次余量。
+    CHAT_LOCK_TIMEOUT_SECONDS: int = 90
+
+    # ---------------- 分诊全局并发闸门 ----------------
+    # 会话锁只保证同一会话不并发，不限总量：1000 个会话同时发起诊断
+    # 就是 1000 路并发的模型调用，把 LLM 端点和进程内存一起打挂。
+    # 闸门限制全系统同时运行的分诊轮次（跨进程，Redis ZSET 信号量）；
+    # 超出的先排队（有界、限时），排不下/等不到则拒绝。
+    # ≤0 = 关闭闸门（本地开发与单测直通）。
+    #
+    # 定标 100 的算法（自建 8B~14B、单卡 H100、上下文 2K~3K）：
+    #   ① KV 预算：(80G×0.9 − 16G 权重 − 2G 激活) = 54G
+    #      ÷ 128KB/token ≈ 42 万 token ÷ 3K 上下文 ≈ 180 路
+    #   ② decode 吞吐：约 4k token/s ÷ 22 token/s/用户 ≈ 180 路
+    #      22 token/s/用户 是大厂实测口径（DeepSeek 公开数据 20~22）
+    #   两条约束取小者 ≈ 180 路模型请求；闸门单位是「诊断轮次」，一轮
+    #   1~2 次模型请求（extract/ask/parse/conclude），180 ÷ 1.5 ≈ 120，
+    #   取 100 留约 40% 余量（上下文变长、并发抖动）。
+    #   ★ 单副本并发做不大是 KV cache 的物理约束：自建引擎超额请求是
+    #     排队不是报错，设高了只会把延迟堆到超时线上，不增加吞吐。
+    # ★ 模型走公司共享端点时按「配额 ÷ 1.5」设，不要按本地机器能力
+    #   推算——配额是别人给的，本地算得再准也超不过它。
+    TRIAGE_GLOBAL_CONCURRENCY: int = 100
+
+    # 单进程最多同时在排队的请求数。排队只是把「稍后重试」推迟一会儿，
+    # 队列本身没有产出 —— 与其让第 500 个请求白等 60 秒，不如现在就
+    # 告诉它重试，还省一个挂起的协程占着 FastAPI worker。
+    TRIAGE_GATE_QUEUE_MAX: int = 200
+
+    # 排队等空位的最长秒数，超时按「系统忙」拒绝，不无限等。
+    TRIAGE_GATE_WAIT_TIMEOUT_SECONDS: float = 60.0
+
+    # 空位轮询间隔（秒）。加 ±20% 抖动防多个等待者同拍惊群；
+    # 非严格 FIFO：多进程下按轮询先后，统计意义上的先来先得。
+    TRIAGE_GATE_POLL_INTERVAL_SECONDS: float = 0.5
+
+    # 空位租约（秒）：持有者进程崩溃（SIGKILL/断电）没走正常释放时，
+    # 空位最多这么久自动归还。持有期间每 1/3 租约时长自动续租，
+    # 正常的长任务不受影响。
+    TRIAGE_GATE_LEASE_SECONDS: float = 90.0
 
     # ---------------- 项目二（知识服务，步 7 才用到）----------------
     KNOWLEDGE_SVC_URL: str = "http://localhost:8001"
@@ -184,6 +243,16 @@ class Settings(BaseSettings):
                 problems.append(f"{field} 仍是默认/弱口令，必须换成强随机值")
         if self.REDIS_PASSWORD and self.REDIS_PASSWORD in ("change-me-redis", "redis", "123456"):
             problems.append("REDIS_PASSWORD 仍是默认/弱口令，必须换成强随机值")
+
+        # 分诊进度必须晚于 checkpointer 过期：反了会让「隔了很久才回答追问」
+        # 的会话走成首轮重跑 + 历史回答被当新输入重新处理（见字段注释）。
+        # 这类错配不会立刻报错，只在特定时序下悄悄答错，所以放到启动期挡。
+        if self.TRIAGE_STATE_TTL_SECONDS <= self.CHECKPOINTER_TTL_MINUTES * 60:
+            problems.append(
+                f"TRIAGE_STATE_TTL_SECONDS({self.TRIAGE_STATE_TTL_SECONDS}) 必须大于 "
+                f"CHECKPOINTER_TTL_MINUTES×60({self.CHECKPOINTER_TTL_MINUTES * 60})"
+                "（分诊进度先过期会导致 resume 误判为首轮，追问序列错位）"
+            )
 
         if problems:
             raise RuntimeError(

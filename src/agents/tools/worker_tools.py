@@ -13,11 +13,13 @@ from langgraph.prebuilt import ToolRuntime
 from langgraph.types import interrupt
 
 from src.agents.triage.graph import run_triage
+from src.agents.triage.gate import triage_gate
 from src.agents.triage.lock import ConversationBusyError, session_lock
 from src.agents.triage.session_store import TriageSessionStore, is_triage_exit
 from src.agents.triage.state import TriagePhase
 from src.agents.workers.triage_agent import TriageAgent
 from src.core.deps import UserContext
+from src.core.exceptions import TriageSystemBusyError
 from src.core.logger import logger
 from src.infra.redis_cache import get_checkpointer_redis
 from src.utils.dtc import extract_dtc_codes
@@ -30,6 +32,46 @@ from src.utils.dtc import extract_dtc_codes
 # ★ 原来这里是纯进程内的 _triage_locks —— 多 worker 部署（Dockerfile 默认
 #   UVICORN_WORKERS=2）下每个进程一把锁，等于没锁，已移除。
 # interrupt 挂起时锁随异常展开释放，resume 重放时重新获取，不会死锁。
+#
+# ── 全局并发闸门 ──
+# 会话锁不限总量：1000 个会话同时发起就是 1000 路模型调用。外层
+# triage_gate（src/agents/triage/gate.py）限制全系统同时运行的诊断轮次，
+# 超出的排队（有界、限时）或拒绝。闸门放在会话锁外层：排队等空位的
+# 几十秒不该计入会话锁的持有时长（那是按「一次 LLM 调用」定标的，
+# 叠加排队时长会逼近 TTL），期间同会话的请求也进不来。
+# interrupt 挂起等用户回答追问时同样随异常展开归还空位 —— 等人的会话
+# 不占模型容量；resume 重放时重新排队取位。
+#
+# ── 被拒时的分流（_triage_busy_fallback）──
+# ★ 追问轮（store 里有进度 = 本次是 resume）被拒必须把异常原样抛出图外，
+#   绝不能 return 文本：工具一旦正常返回，langgraph 就把挂起的 interrupt
+#   当「节点完成」消费掉，checkpoint 越过追问点，而 store 还停在原轮 ——
+#   两条状态机永久错位（下次追问文本变空、轮次对不上）。抛出后
+#   checkpoint 停在原地，chat 路由回放挂起追问，用户稍后重答即可。
+#   全新诊断被拒没有可错位的状态，返回人话由模型转述即可。
+
+
+async def _triage_busy_fallback(exc: Exception, store: TriageSessionStore, thread_id: str) -> str:
+    """分诊被拒（系统容量满 / 会话忙）的分流：追问轮抛出保状态，新诊断回人话。
+
+    Raises:
+        Exception: 会话已有分诊进度（本次是追问回答）时原样上抛 exc。
+    """
+    try:
+        resuming = await store.load(thread_id) is not None
+    except Exception as load_err:
+        # ★ 判定不了就往状态安全一侧倒：原样上抛。万一其实是追问轮，
+        #   return 文本会消费掉挂起的 interrupt 造成状态机错位（不可逆）；
+        #   而误抛「忙」最多让全新诊断的用户重试一次（可逆）。
+        logger.warning(f"[TRIAGE] 被拒后读取会话进度失败，按追问轮上抛 thread={thread_id}: {load_err}")
+        raise exc
+    if resuming:
+        raise exc
+    if isinstance(exc, TriageSystemBusyError):
+        logger.info(f"[TRIAGE] 系统容量满，闸门拒绝 thread={thread_id}")
+        return "当前诊断请求较多，系统正在排队处理。请稍后重试。"
+    logger.info(f"[TRIAGE] 会话忙，拒绝并发处理 thread={thread_id}")
+    return "上一次诊断还在处理中（可能是刚才那条消息）。请稍等几秒再发送。"
 
 
 def _interrupt_payload(round_no: int, question: str) -> dict:
@@ -74,26 +116,42 @@ async def call_triage_agent(message: str, runtime: ToolRuntime[UserContext]) -> 
     business_line = runtime.context.business_line or ""
 
     try:
-        async with session_lock(thread_id):
-            return await _run_triage_turn(
-                message, user_id, session_id, role, thread_id, business_line
-            )
-    except ConversationBusyError:
-        # ★ 必须捕获后返回文本，不能往上抛：ConversationBusyError 是裸
-        #   Exception，交给全局处理器会变成 HTTP 500，用户以为系统挂了。
-        #   这里返回一句人话，模型会把它展示给用户（同时日志留痕）。
-        logger.info(f"[TRIAGE] 会话忙，拒绝并发处理 thread={thread_id}")
-        return "上一次诊断还在处理中（可能是刚才那条消息）。请稍等几秒再发送。"
+        async with triage_gate():
+            async with session_lock(thread_id):
+                return await _run_triage_turn(
+                    message, user_id, session_id, role, thread_id, business_line
+                )
+    except (TriageSystemBusyError, ConversationBusyError) as e:
+        store = TriageSessionStore(get_checkpointer_redis())
+        return await _triage_busy_fallback(e, store, thread_id)
 
 
 async def _run_triage_turn(
     message: str, user_id, session_id, role, thread_id: str, business_line: str = "",
 ) -> str:
+    # 先读会话状态再构造 Agent：下面的放弃分支不需要模型依赖，
+    # 把 Redis 读放前面既省掉一次 LLM 客户端构造，也让该分支能脱离模型单测。
+    store = TriageSessionStore(get_checkpointer_redis())
+    saved = await store.load(thread_id)
+
+    # ★ 进度没了、但「有追问在等回答」的标记还在 = 本次是 resume 而进度已过期
+    #   （Redis 淘汰 / 清库 / TTL 配错；正常时序下不该发生，见 session_store
+    #   头部的 TTL 约定）。此时绝不能按首轮重跑：resume 重放会把 checkpointer
+    #   里记录的历史回答当成本轮新输入重新处理一遍，追问序列与 round 从此错位。
+    #   直接放弃这段对话，让用户重新描述。
+    #   ★ 这里 return 文本是安全的，与 _triage_busy_fallback 的告诫不冲突：
+    #     那条告诫针对「store 还停在原轮」——返回文本会让 checkpoint 越过追问点
+    #     而 store 不动，两个状态机永久错位。本分支 store 已被清空，没有需要对账
+    #     的进度，checkpoint 越过旧的追问点正是我们要的结果（图继续往下走，
+    #     把这句话交给用户）。
+    if saved is None and await store.is_pending(thread_id):
+        logger.warning(f"[TRIAGE] 进度已过期但有挂起追问，放弃该对话 thread={thread_id}")
+        await store.clear(thread_id)
+        return "上次诊断的上下文已经过期了（间隔太久），请重新描述一下故障现象。"
+
     agent = TriageAgent()
     deps = agent._build_deps()
-    store = TriageSessionStore(get_checkpointer_redis())
 
-    saved = await store.load(thread_id)
     if saved is None:
         # 首轮：立即跑第一轮诊断；不收敛则落盘进度，进入追问循环
         reply, state = await run_triage(

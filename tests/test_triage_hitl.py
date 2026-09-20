@@ -52,7 +52,7 @@ def _make_fake_model(responses: list):
 
 
 class StubRedis:
-    """异步接口的最小 redis stub（set/get/delete）。"""
+    """异步接口的最小 redis stub（set/get/delete/expire）。"""
 
     def __init__(self):
         self.data = {}
@@ -66,6 +66,10 @@ class StubRedis:
     async def delete(self, *keys):
         for k in keys:
             self.data.pop(k, None)
+
+    async def expire(self, key, ttl):
+        """TriageSessionStore.load() 会读时续期，替身必须能接住。"""
+        return key in self.data
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -329,3 +333,66 @@ async def test_create_agent_exit_during_triage():
     tool_msg = [m for m in r2["messages"] if m.type == "tool"][0]
     assert "退出" in tool_msg.content
     assert await store.load("u2:s2") is None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 5. 被拒异常穿出图的契约（全局闸门 / 会话锁在追问轮拒绝时的状态保持）
+# ════════════════════════════════════════════════════════════════════════
+
+async def test_busy_exception_on_resume_keeps_interrupt_pending():
+    """★ resume 轮被拒必须抛异常而不是返回文本 —— langgraph 契约回归。
+
+    call_triage_agent 在追问轮被闸门/会话锁拒绝时把异常原样抛出图外
+    （见 worker_tools._triage_busy_fallback）。本用例锁住这一设计依赖的
+    底层契约，langgraph 升级破坏了它这里就会红：
+      1. resume 执行中工具抛异常 → 异常穿出 ainvoke（不被 ToolNode 吞）；
+      2. 快照仍挂起 interrupt —— checkpoint 未前进，会话仍可恢复；
+      3. 重试后图按已提交的回答跑完（回答不因失败而丢）。
+    """
+    from src.core.exceptions import TriageSystemBusyError
+
+    redis = StubRedis()
+    store = TriageSessionStore(redis)
+    attempts = {"resume": 0}
+
+    @tool
+    async def stub_triage(message: str) -> str:
+        """模拟分诊工具：追问轮第一次 resume 被系统忙拒绝。"""
+        saved = await store.load("u3:s3")
+        if saved is None:
+            await store.save("u3:s3", TriageState(session_id="u3:s3"), "是否黑屏？")
+        answer = interrupt({"type": "triage_followup", "question": "是否黑屏？"})
+        attempts["resume"] += 1
+        if attempts["resume"] == 1:
+            raise TriageSystemBusyError()
+        await store.clear("u3:s3")
+        return f"结论（基于回答：{answer}）"
+
+    model = _make_fake_model([
+        AIMessage(content="", tool_calls=[
+            {"name": "stub_triage", "args": {"message": "车机黑屏"}, "id": "call_1"}
+        ]),
+        AIMessage(content="诊断完成。"),
+    ])
+
+    agent = create_agent(model=model, tools=[stub_triage], system_prompt="test", checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "u3:s3"}}
+
+    # 首轮：暂停在追问
+    r1 = await agent.ainvoke({"messages": [{"role": "user", "content": "车机黑屏"}]}, config)
+    assert "__interrupt__" in r1
+
+    # resume 轮被拒：异常必须穿出，且不能把挂起的追问消费掉
+    with pytest.raises(TriageSystemBusyError):
+        await agent.ainvoke(Command(resume="是，重启也没用"), config)
+
+    snapshot = await agent.aget_state(config)
+    assert any(t.interrupts for t in snapshot.tasks), "checkpoint 前进了，追问被消费"
+    assert attempts["resume"] == 1
+    assert await store.load("u3:s3") is not None, "会话进度不能丢"
+
+    # 重试：图按已提交的回答跑完（langgraph 沿用已提交的 resume 值）
+    r3 = await agent.ainvoke(Command(resume="是，重启也没用"), config)
+    tool_msg = [m for m in r3["messages"] if m.type == "tool"][0]
+    assert "结论" in tool_msg.content
+    assert await store.load("u3:s3") is None

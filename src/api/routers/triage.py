@@ -1,14 +1,18 @@
 """分诊 API Router。POST /api/v1/triage"""
 
+from contextlib import nullcontext
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from src.agents.workers.triage_agent import get_triage_agent
+from src.agents.triage.gate import triage_gate
+from src.agents.triage.lock import ConversationBusyError, session_lock
 from src.agents.triage.session_store import TriageSessionStore
 from src.agents.triage.state import TriageState
 from src.core.base_schema import ResponseSchema
 from src.core.deps import UserContext, get_current_user
-from src.core.exceptions import ERR_PERMISSION_DENIED, BizException
+from src.core.exceptions import ERR_CONVERSATION_BUSY, ERR_PERMISSION_DENIED, BizException
 from src.core.logger import logger
 from src.core.rate_limit import rate_limit
 from src.infra.redis_cache import get_checkpointer_redis
@@ -51,6 +55,9 @@ class TriageResult(BaseModel):
     confidence: float
     follow_up_questions: list[str]
     diagnostic_summary: str
+    # 本次结论在 ai_triage_results 的行 id（收敛时才有）。反馈接口带上它可以
+    # 精确回写这一条 —— 同一会话里重复诊断是正常行为，会有多行结论。
+    record_id: int | None = Field(None, description="诊断记录 id，用于 /feedback 精确回写")
 
 
 @router.post("", response_model=ResponseSchema[TriageResult])
@@ -75,30 +82,63 @@ async def triage(
     masked_input = mask_free_text(req.raw_input)
     logger.info(f"[TRIAGE] user={user.user_id} session={req.session_id or 'new'} input={masked_input[:80]}")
 
-    # 从 store 恢复上一轮状态（如有）
-    existing_state = None
-    if thread_key:
-        store = TriageSessionStore(get_checkpointer_redis())
-        progress = await store.load(thread_key)
-        if progress:
-            existing_state = progress.state
-
     agent = get_triage_agent()
-    result = await agent.diagnose(
-        raw_input=masked_input,
-        session_id=thread_key,
-        issue_id=req.issue_id,
-        existing_state=existing_state,
-    )
+    # 全局并发闸门（chat 工具 / webhook 自动分诊共用同一额度）：满员时
+    # 有界排队，排队失败抛 TriageSystemBusyError —— 它是 BizException 子类，
+    # 全局处理器会回 42902/HTTP 429，无需在这里捕获。
+    # ★ 闸门在会话锁外层：排队等空位的几十秒不该计入锁的持有时长。
+    #
+    # ★ 会话锁与本模块的 key 规范必须和 chat 工具一致（triage_lock:{thread_key}）：
+    #   这条路径的 load→diagnose→save 和 chat 的分诊工具作用于同一份
+    #   triage_state:{thread_key}。不互斥的话两者会各自读到同一份进度、
+    #   各跑一轮、后写覆盖先写，state.round 直接错位（下次追问文本对不上）。
+    #   原来这里只有全局闸门 —— 限总量不挡具体谁，挡不住这个。
+    #   新建会话（无 session_id）不锁：session_id 由 diagnose 现场生成，
+    #   不存在第二个请求能摸到它。
+    lock_cm = session_lock(thread_key) if thread_key else nullcontext()
+    try:
+        async with triage_gate():
+            async with lock_cm:
+                # 从 store 恢复上一轮状态（如有）
+                existing_state = None
+                if thread_key:
+                    store = TriageSessionStore(get_checkpointer_redis())
+                    progress = await store.load(thread_key)
+                    if progress:
+                        existing_state = progress.state
 
-    # 如果未收敛，将状态写入 store 供下一轮使用
-    if result["status"] == "asking" and result["_state"]:
-        store = TriageSessionStore(get_checkpointer_redis())
-        await store.save(
-            result["session_id"],
-            TriageState(**result["_state"]),
-            reply=result.get("follow_up_questions", [""])[0] if result.get("follow_up_questions") else "",
-        )
+                result = await agent.diagnose(
+                    raw_input=masked_input,
+                    session_id=thread_key,
+                    issue_id=req.issue_id,
+                    existing_state=existing_state,
+                )
+
+                # 未收敛 → 落盘进度供下一轮；收敛/超轮 → 清掉进度。
+                # ★ 收敛必须清，与 chat 路径的 _finish_triage 保持一致（清进度 =
+                #   这段对话结束）。不清的话，同一 session_id 的下一次诊断会读到
+                #   上一段的进度、按「第 N+1 轮」续聊 —— 两个不相干的诊断串在一起
+                #   （确认现象、否定现象、候选根因全被继承）。
+                #   挂起标记也随之清掉：收敛之后没有「在等回答的追问」，
+                #   留着它只会让后续判断误判。
+                store = TriageSessionStore(get_checkpointer_redis())
+                if result["status"] == "asking" and result["_state"]:
+                    await store.save(
+                        result["session_id"],
+                        TriageState(**result["_state"]),
+                        reply=(result.get("follow_up_questions") or [""])[0],
+                    )
+                else:
+                    await store.clear(result["session_id"])
+    except ConversationBusyError as e:
+        # ★ 必须在这里转成 BizException：ConversationBusyError 故意不是
+        #   BizException 子类（它的设计前提是「被 chat 路由捕获、图可能停在
+        #   追问中途」），漏到全局处理器会变成 500 —— 用户以为系统挂了。
+        #   REST 这条路径没有图内状态要保，忙就是干净的业务拒绝（409）。
+        logger.info(f"[TRIAGE] 会话忙，拒绝并发处理 thread={thread_key}")
+        raise BizException(
+            "上一次诊断还在处理中，请稍等几秒再发送。", ERR_CONVERSATION_BUSY
+        ) from e
 
     triage_result = TriageResult(
         session_id=result["session_id"],
@@ -109,6 +149,7 @@ async def triage(
         confidence=result["confidence"],
         follow_up_questions=result["follow_up_questions"],
         diagnostic_summary=result["diagnostic_summary"],
+        record_id=result.get("record_id"),
     )
 
     logger.info(
@@ -130,11 +171,18 @@ class FeedbackRequest(BaseModel):
         None,
         description="人工纠正时的正确根因编码（如 RC-EV-0012）；不采纳时传入，回写图谱",
     )
+    record_id: int | None = Field(
+        None,
+        description="要回写的诊断记录 id（ai_triage_results.id）。不传则作用于本会话"
+                    "最新一条 —— 同一会话多次诊断时用它避免反馈错行",
+    )
 
 
 class FeedbackResult(BaseModel):
     session_id: str
     updated: bool
+    # 实际回写的行 id：后续对同一行再次反馈时带上它可避免歧义
+    record_id: int | None = None
 
 
 @router.post("/feedback", response_model=ResponseSchema[FeedbackResult])
@@ -159,48 +207,64 @@ async def submit_feedback(req: FeedbackRequest, user: UserContext = Depends(get_
     logger.info(f"[TRIAGE-FB] session={req.session_id} adopted={req.adopted}")
 
     async with AsyncSessionLocal() as db:
-        # 先查当前记录拿到 confirmed_phenomena 和 primary_cause_code
-        select_result = await db.execute(
-            sa_text(
-                "SELECT confirmed_phenomena, primary_cause_code "
-                "FROM ai_triage_results WHERE session_id = :session_id"
-            ),
-            {"session_id": req.session_id},
-        )
-        row = select_result.fetchone()
-
-        result = await db.execute(
+        # ★ 先定位唯一一行，再按主键回写。同一 session_id 下会有多行（用户在
+        #   同一会话里重复诊断是正常行为），按 session_id 整批更新会把该会话
+        #   所有历史结论一起标记为已采纳；而且拿去回流图谱的现象/根因也会取自
+        #   其中任一行（原来的 fetchone 没有任何排序，取哪行不确定）。
+        if req.record_id is not None:
+            target_sql = (
+                "SELECT id, confirmed_phenomena, primary_cause_code FROM ai_triage_results "
+                "WHERE id = :record_id AND session_id = :session_id"
+            )
+            target_params = {"record_id": req.record_id, "session_id": req.session_id}
+        else:
+            # 不带 id 时取最新一行 —— 用户刚看到的那条结论
+            target_sql = (
+                "SELECT id, confirmed_phenomena, primary_cause_code FROM ai_triage_results "
+                "WHERE session_id = :session_id ORDER BY id DESC LIMIT 1"
+            )
+            target_params = {"session_id": req.session_id}
+        row = (await db.execute(sa_text(target_sql), target_params)).fetchone()
+        if row is None:
+            logger.warning(
+                f"[TRIAGE-FB] 无匹配记录 session={req.session_id} record={req.record_id}"
+            )
+            return ResponseSchema(
+                data=FeedbackResult(session_id=req.session_id, updated=False)
+            )
+        target_id, phenomena_raw, cause_code = row[0], row[1], row[2]
+        # 额外带 session_id：即使有人拿别人的 record_id 来试，也落不到那行上
+        await db.execute(
             sa_text(
                 "UPDATE ai_triage_results SET adopted = :adopted, feedback_comment = :comment, "
-                "updated_at = NOW() WHERE session_id = :session_id"
+                "updated_at = NOW() WHERE id = :target_id AND session_id = :session_id"
             ),
             {
                 "adopted": req.adopted,
                 "comment": req.comment,
+                "target_id": target_id,
                 "session_id": req.session_id,
             },
         )
         await db.commit()
-        updated = result.rowcount > 0
+        updated = True
+
+    confirmed = json.loads(phenomena_raw) if isinstance(phenomena_raw, str) else (phenomena_raw or [])
 
     # ── 触发诊断结论回流图谱 ──
-    if updated and req.adopted and row:
+    if req.adopted:
         try:
-            confirmed = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
-            cause_code = row[1]
             from src.agents.triage.feedback_loop import reinforce_graph_on_adopted
             await reinforce_graph_on_adopted(
                 confirmed_phenomena=confirmed,
                 primary_cause_code=cause_code,
                 session_id=req.session_id,
             )
-            logger.info(f"[TRIAGE-FB] 图谱增强已触发 session={req.session_id}")
+            logger.info(f"[TRIAGE-FB] 图谱增强已触发 session={req.session_id} record={target_id}")
         except Exception as e:
             logger.warning(f"[TRIAGE-FB] 图谱增强失败: {e}")
-    elif updated and not req.adopted and row:
+    else:
         try:
-            confirmed = json.loads(row[0]) if isinstance(row[0], str) else (row[0] or [])
-            cause_code = row[1]
             from src.agents.triage.feedback_loop import weaken_graph_on_rejected
             await weaken_graph_on_rejected(
                 confirmed_phenomena=confirmed,
@@ -208,10 +272,12 @@ async def submit_feedback(req: FeedbackRequest, user: UserContext = Depends(get_
                 correct_cause_code=req.correct_cause_code,
             )
             logger.info(
-                f"[TRIAGE-FB] 图谱弱化已触发 session={req.session_id} "
+                f"[TRIAGE-FB] 图谱弱化已触发 session={req.session_id} record={target_id} "
                 f"correct={req.correct_cause_code or '未提供'}"
             )
         except Exception as e:
             logger.warning(f"[TRIAGE-FB] 图谱弱化失败: {e}")
 
-    return ResponseSchema(data=FeedbackResult(session_id=req.session_id, updated=updated))
+    return ResponseSchema(
+        data=FeedbackResult(session_id=req.session_id, updated=updated, record_id=target_id)
+    )

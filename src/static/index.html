@@ -213,6 +213,21 @@ body {
 }
 .safety-alert h4 { color:var(--danger); font-size:14px; margin-bottom:6px; }
 
+/* Busy / Retry Notice — 系统容量满、会话忙等可重试的业务提示。
+   与真错误（⚠️ 红色警示）区分：忙是暂态，重试即可，不该吓到用户 */
+.busy-notice {
+  border:1px solid var(--warning); border-radius:var(--radius); padding:12px 16px;
+  background:var(--warning-light); margin:10px 0;
+  display:flex; align-items:center; gap:12px; justify-content:space-between;
+}
+.busy-notice .bn-text { color:var(--body); font-size:13px; line-height:1.6; }
+.retry-btn {
+  padding:6px 14px; border:none; border-radius:var(--radius-sm); cursor:pointer;
+  background:var(--warning); color:#fff; font-size:13px; font-weight:500; flex-shrink:0;
+  transition:filter .15s;
+}
+.retry-btn:hover { filter:brightness(.95); }
+
 /* Welcome */
 .welcome { text-align:center; padding:40px 20px 0; }
 .welcome h2 { font-size:22px; color:var(--title); margin-bottom:6px; }
@@ -436,7 +451,71 @@ function persist() {
 /* ══════════════════════════════════════════════════════════════
    Chat API — SSE Streaming
    ══════════════════════════════════════════════════════════════ */
-async function send(msg) {
+
+// 忙类业务错误码（会话忙 / 系统容量满 / 请求过频）：暂态，重试即可，
+// 与真故障（5xx）分开渲染 —— 见 chat.py SSE error 帧的 code 字段
+const BUSY_CODES = [40409, 42902, 42901];
+const isBusyCode = c => BUSY_CODES.includes(c);
+
+/* 逐帧解析 SSE 响应流。onToken / onError / onDone 按帧回调。 */
+async function readSSE(resp, h) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const {done,value} = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value,{stream:true});
+    const frames = buf.split('\n\n');
+    buf = frames.pop();
+    for (const f of frames) {
+      const line = f.trim();
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const d = JSON.parse(line.slice(6));
+        if (d.type==='token') h.onToken(d.content);
+        else if (d.type==='error') h.onError(d);
+        else if (d.type==='done') h.onDone(d);
+      } catch(e){}
+    }
+  }
+}
+
+/* 非 200 响应（限流 429 / 业务码非 200 等）：取后端的用户可读文案 */
+async function errFromResp(resp) {
+  let msg = '服务异常（'+resp.status+'）', code = 0;
+  try {
+    const j = await resp.json();
+    if (j && j.message) msg = j.message;
+    if (j && j.code) code = j.code;
+  } catch(e){}
+  return {msg, code};
+}
+
+/* 把助手占位气泡替换为「排队提示 + 重试按钮」。
+   onRetry 闭包由调用方提供（重发原消息，且不重复入栈用户消息） */
+function renderBusyNotice(placeholder, message, onRetry) {
+  const bubble = placeholder.querySelector('.bubble');
+  if (!bubble) return;
+  bubble.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'busy-notice';
+  const text = document.createElement('div');
+  text.className = 'bn-text';
+  text.textContent = '⏳ ' + message;
+  const btn = document.createElement('button');
+  btn.className = 'retry-btn';
+  btn.textContent = '↻ 重试';
+  btn.onclick = onRetry;
+  box.appendChild(text);
+  box.appendChild(btn);
+  bubble.appendChild(box);
+  scrollDown();
+}
+
+async function send(msg, opts) {
+  opts = opts || {};
+  const retry = !!opts.retry;   // 重试：用户消息已在历史里，不重复入栈
   const input = document.getElementById('userInput');
   const text = msg || input.value.trim();
   if (!text) return;
@@ -449,8 +528,10 @@ async function send(msg) {
 
   // Append user message
   if (!store.history) store.history = [];
-  store.history.push({role:'user',content:text});
-  appendMessage('user', text);
+  if (!retry) {
+    store.history.push({role:'user',content:text});
+    appendMessage('user', text);
+  }
   scrollDown();
   setSending(true);
 
@@ -461,35 +542,42 @@ async function send(msg) {
   // Streaming
   const placeholder = appendMessage('assistant', '<div class="typing"><span></span><span></span><span></span></div>', true);
   let full = '';
+  let busyMsg = null;   // 非 null = 被忙类业务错拒绝（可重试）
   try {
     const resp = await fetch(BASE+'/api/v1/chat/stream', {
       method:'POST',
       headers:{'Content-Type':'application/json','X-User-Id':store.user_id},
       body: JSON.stringify({session_id:store.activeSid,message:text})
     });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const {done,value} = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value,{stream:true});
-      const lines = buf.split('\n\n');
-      buf = lines.pop();
-      for (const l of lines) {
-        const line = l.trim();
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const d = JSON.parse(line.slice(6));
-          if (d.type==='token') { full+=d.content; updateBubble(placeholder, full); scrollDown(); }
-          else if (d.type==='done') { full = d.content||full; updateBubble(placeholder, full); }
-          else if (d.type==='error') { full='⚠️ '+d.message; updateBubble(placeholder, full); }
-        } catch(e){}
-      }
+    if (!resp.ok) {
+      const {msg:m, code} = await errFromResp(resp);
+      if (isBusyCode(code)) busyMsg = m;
+      else { full = '⚠️ ' + m; updateBubble(placeholder, full); }
+    } else {
+      await readSSE(resp, {
+        onToken: c => { full += c; updateBubble(placeholder, full); scrollDown(); },
+        onError: d => {
+          if (isBusyCode(d.code)) busyMsg = d.message;
+          else { full = '⚠️ ' + d.message; updateBubble(placeholder, full); }
+        },
+        onDone: () => {}
+      });
     }
   } catch(e) {
     full = '⚠️ 请求失败: ' + e.message;
     updateBubble(placeholder, full);
+  }
+
+  // 忙被拒：提示不入会话历史（不是对话内容），给一键重试
+  if (busyMsg) {
+    renderBusyNotice(placeholder, busyMsg, () => {
+      placeholder.remove();
+      send(text, {retry:true});
+    });
+    persist();
+    renderSessionList();
+    setSending(false);
+    return;
   }
 
   store.history.push({role:'assistant',content:full});
@@ -612,33 +700,37 @@ function handleAction(action) {
 async function sendActionReply(msg) {
   setSending(true);
   const placeholder = appendMessage('assistant','<div class="typing"><span></span><span></span><span></span></div>',true);
+  let full='', busyMsg = null;
   try {
     const resp = await fetch(BASE+'/api/v1/chat/stream',{
       method:'POST',
       headers:{'Content-Type':'application/json','X-User-Id':store.user_id},
       body:JSON.stringify({session_id:store.activeSid,message:msg})
     });
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf='',full='';
-    while(true){
-      const {done,value}=await reader.read();
-      if(done) break;
-      buf+=decoder.decode(value,{stream:true});
-      const lines=buf.split('\n\n');
-      buf=lines.pop();
-      for(const l of lines){
-        const line=l.trim();
-        if(!line.startsWith('data: ')) continue;
-        try{
-          const d=JSON.parse(line.slice(6));
-          if(d.type==='token'){full+=d.content;updateBubble(placeholder,full);scrollDown();}
-          else if(d.type==='done'){updateBubble(placeholder,full||d.content);}
-          else if(d.type==='error'){updateBubble(placeholder,'⚠️ '+d.message);}
-        }catch(e){}
-      }
+    if (!resp.ok) {
+      const {msg:m, code} = await errFromResp(resp);
+      if (isBusyCode(code)) busyMsg = m;
+      else { full = '⚠️ ' + m; updateBubble(placeholder, full); }
+    } else {
+      await readSSE(resp, {
+        onToken: c => { full+=c; updateBubble(placeholder, full); scrollDown(); },
+        onError: d => {
+          if (isBusyCode(d.code)) busyMsg = d.message;
+          else { full = '⚠️ ' + d.message; updateBubble(placeholder, full); }
+        },
+        onDone: () => {}
+      });
     }
-  }catch(e){updateBubble(placeholder,'⚠️ 请求失败: '+e.message);}
+  }catch(e){ full='⚠️ 请求失败: '+e.message; updateBubble(placeholder, full); }
+
+  if (busyMsg) {
+    renderBusyNotice(placeholder, busyMsg, () => {
+      placeholder.remove();
+      sendActionReply(msg);
+    });
+    setSending(false);
+    return;
+  }
   store.history.push({role:'assistant',content:full||''});
   updateBubble(placeholder,full||'');
   updateContextPanel(full||'');

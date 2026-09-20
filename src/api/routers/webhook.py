@@ -328,16 +328,22 @@ async def _auto_triage_new_issue(issue_no: str, data: dict) -> None:
             message += f"\nDTC: {data['dtc_snapshot']}"
 
         logger.info(f"[AUTO-TRIAGE] 开始分诊 issue={issue_no} thread={thread_id}")
-        reply, new_state = await run_triage(
-            user_message=message,
-            thread_id=thread_id,
-            deps=deps,
-            existing_state=None,
-            viewer_role=data.get("source", "customer"),
-            # 业务线取平台 payload（alm_issues.business_line 非空），
-            # 否则现象词表和候选根因不过滤、会跨线串味
-            business_line=data.get("business_line") or "",
-        )
+        # 全局并发闸门：自动分诊与在线诊断共享同一模型额度，平台批量
+        # 导入问题单时不许把在线诊断挤下线。排队失败（系统满员）走下面的
+        # except 记为分诊失败 —— 事件本身不重放，与现有失败语义一致。
+        from src.agents.triage.gate import triage_gate
+
+        async with triage_gate():
+            reply, new_state = await run_triage(
+                user_message=message,
+                thread_id=thread_id,
+                deps=deps,
+                existing_state=None,
+                viewer_role=data.get("source", "customer"),
+                # 业务线取平台 payload（alm_issues.business_line 非空），
+                # 否则现象词表和候选根因不过滤、会跨线串味
+                business_line=data.get("business_line") or "",
+            )
 
         logger.info(
             f"[AUTO-TRIAGE] 分诊完成 issue={issue_no} "

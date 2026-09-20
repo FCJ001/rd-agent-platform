@@ -103,6 +103,8 @@ class TriageAgent:
             "confidence": result.confidence,
             "follow_up_questions": result.follow_up_questions if status == "asking" else [],
             "diagnostic_summary": result.diagnostic_summary if status == "converged" else "",
+            # 落库 id（收敛时才有）：反馈回写用它精确定位这一行，避免同会话多行时错行
+            "record_id": result.result_id,
             "_state": result.model_dump(),  # 调用方可缓存用于下一轮
         }
 

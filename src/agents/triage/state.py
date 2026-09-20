@@ -44,6 +44,9 @@ class TriageState(BaseModel):
     # 是「我上次的诊断」这个检索维度的依据，也是反馈接口的所有权来源
     user_id: str = ""
     issue_id: int | None = None
+    # 本次诊断落库后的 ai_triage_results.id。反馈回写用它精确定位这一行 ——
+    # 同一会话里重复诊断会产生多行，没有它只能按「最新一行」猜。
+    result_id: int | None = None
     # issue context (loaded from DB when issue_id is provided)
     issue_title: str = ""
     issue_desc: str = ""

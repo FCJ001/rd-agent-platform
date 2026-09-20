@@ -456,7 +456,7 @@ async def node_save_record(state: TriageState, deps: TriageDeps) -> dict:
 
     async with deps.db_session_factory() as db:
         # session_scope 退出时 commit —— 结果真正落库
-        await save_triage_result(db, {
+        new_id = await save_triage_result(db, {
             "issue_id": state.issue_id,
             "session_id": state.session_id,
             "user_id": state.user_id,
@@ -475,7 +475,9 @@ async def node_save_record(state: TriageState, deps: TriageDeps) -> dict:
         })
 
     logger.info(f"[TRIAGE] 节点⑦ save_record done cause={top1.code} confidence={confidence:.0%}")
-    return {"phase": TriagePhase.END}
+    # 回传落库 id：反馈回写据此精确定位这一行（同一会话可能有多行结论，
+    # 按 session_id 回写会把历史结论一起标记）
+    return {"phase": TriagePhase.END, "result_id": new_id}
 
 
 # ════════════════════════════════════════════════════════════════════════

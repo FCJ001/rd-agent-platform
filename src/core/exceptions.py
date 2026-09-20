@@ -29,6 +29,7 @@ ERR_ISSUE_NOT_FOUND = 40301    # 问题单不存在或不在当前角色可见�
 ERR_AGENT_FAILED = 40401       # Agent 执行失败（模型超时、工具调用异常等）
 ERR_CONVERSATION_BUSY = 40409  # 同一会话已有请求在处理中（并发被拒）
 ERR_RATE_LIMITED = 42901       # 请求过于频繁（限流），LMM 端点成本保护
+ERR_SYSTEM_BUSY = 42902        # 系统并发已达上限（分诊全局闸门），请求被拒
 ERR_INTERNAL = 50000           # 服务端未知错误
 
 # 业务码 → HTTP 状态码。不在表里的业务码一律 HTTP 200（前端按 code 展示）
@@ -41,6 +42,7 @@ BIZ_HTTP_STATUS = {
     # 映射成 5xx 会让监控告警、重试中间件把它当成服务不可用
     ERR_CONVERSATION_BUSY: 409,
     ERR_RATE_LIMITED: 429,
+    ERR_SYSTEM_BUSY: 429,
 }
 
 
@@ -65,6 +67,22 @@ class ConversationBusyError(Exception):
     def __init__(self, thread_id: str = ""):
         self.thread_id = thread_id
         super().__init__(f"会话正在处理中: {thread_id}")
+
+
+class TriageSystemBusyError(BizException):
+    """分诊全局并发闸门拒绝：系统同时在跑的诊断已达上限，排队失败。
+
+    ★ 与 ConversationBusyError 区分，两者前端文案和重试策略都不同：
+      那个是「同一会话的上一条还在跑」（用户自己造成的，等几秒即可）；
+      这个是「全系统正忙」（与用户无关，需要稍后整体重试）。
+
+    ★ 继承 BizException 而不是裸 Exception：万一新入口忘了捕获，
+      走全局处理器返回干净的业务错误码（42902/HTTP 429），
+      而不是 500 让用户以为系统挂了。
+    """
+
+    def __init__(self, message: str = "当前诊断请求较多，请稍后再试"):
+        super().__init__(message, ERR_SYSTEM_BUSY)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
