@@ -40,6 +40,11 @@ class TriageState(BaseModel):
     phase: TriagePhase = TriagePhase.EXTRACT
     round: int = 0
     session_id: str = ""
+    # 业务线（数据作用域）。★ 曾经缺失：节点③/node_load_issue 读写它，但字段
+    # 没声明 —— 构造入参被 pydantic 静默丢弃、属性读取直接 AttributeError。
+    # tests/ 此前没有用例真正跑到节点③（live eval 是 integration），单图化
+    # 端到端测试首次全链路执行引擎时炸出（test_orchestrator_subgraph）。
+    business_line: str = ""
     # 诊断发起人（users.id 的字符串形式）。落进 ai_triage_results.user_id，
     # 是「我上次的诊断」这个检索维度的依据，也是反馈接口的所有权来源
     user_id: str = ""

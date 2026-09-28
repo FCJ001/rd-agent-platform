@@ -54,3 +54,19 @@ python eval/run_eval.py --live --threshold 0.8
 - 评分级：改置信度公式时**必须**新增/调整对照案例，区间断言收紧到能区分新旧行为。
 - 实况：`expect_cause` 用数组表示 any-of —— 知识库里现象集完全重合的候选（如
   RC-IA-0001/0002）不强行二选一，否则测的是知识库而不是分诊。
+
+## L0 路由评测（新增）
+
+测的是 **Supervisor 的路由质量**（消息 → 工具选择），与 L1-L6（分诊内核）互补。
+改 supervisor prompt / 加删工具后必跑。
+
+```bash
+# CI 静态门禁（无需 LLM/外部服务，随单测跑）：
+#   tests/test_routing_eval.py —— case schema、工具全覆盖、prompt 描述齐全、词表不相交
+python eval/run_routing_eval.py              # 实况（需 DASHSCOPE_API_KEY），门限 0.9
+```
+
+断言语义：`expect_tools` 任一命中被调集合即过（业务工具剔除 search_memory/save_memory
+记忆前奏，允许合法链式调用如 历史→判重→分诊）；`expect_not` 命中即败；
+`expect_none_business=true` 断言零业务调用。探针 agent 与线上共用同一份
+`get_supervisor_toolset()` + system prompt，工具体替换为无副作用桩。

@@ -1,0 +1,185 @@
+{
+ "description": "L0 路由评测：消息 → 工具选择。改 supervisor prompt / 加删工具后必跑（python eval/run_routing_eval.py）。断言语义：expect_tools 任一命中【被调用集合】即过（业务工具集合剔除 search_memory/save_memory 记忆前奏，允许合法链式调用如 历史→判重→分诊）；expect_not 中任何一个被调用即失败；expect_none_business=true 断言不调用任何业务工具。",
+ "cases": [
+  {
+   "id": "L0-01",
+   "message": "车机中控屏黑屏，高速上出现过两次",
+   "expect_tools": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-02",
+   "message": "车子动力不足，仪表盘报了 P0A7F 故障码",
+   "expect_tools": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-03",
+   "message": "空调不制冷，充电的时候也一样",
+   "expect_tools": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-04",
+   "message": "800V 高压系统的绝缘设计标准是什么",
+   "expect_tools": [
+    "call_knowledge_agent"
+   ],
+   "expect_not": [
+    "call_operation_agent"
+   ]
+  },
+  {
+   "id": "L0-05",
+   "message": "BMS 的 SOC 估算算法原理讲一下",
+   "expect_tools": [
+    "call_knowledge_agent"
+   ],
+   "expect_not": [
+    "call_operation_agent"
+   ]
+  },
+  {
+   "id": "L0-06",
+   "message": "最近一个月各业务线的缺陷密度对比",
+   "expect_tools": [
+    "call_operation_agent"
+   ],
+   "expect_not": [
+    "call_knowledge_agent"
+   ]
+  },
+  {
+   "id": "L0-07",
+   "message": "这个月 EV 线的问题单关闭率趋势怎么样",
+   "expect_tools": [
+    "call_operation_agent"
+   ],
+   "expect_not": [
+    "call_knowledge_agent"
+   ]
+  },
+  {
+   "id": "L0-08",
+   "message": "解读一下这份 DTC 扫描报告：U0100 出现 2 次，U0121 出现 1 次，电池 SOH 71%",
+   "expect_tools": [
+    "call_report_agent"
+   ]
+  },
+  {
+   "id": "L0-09",
+   "message": "评估一下这个变更的影响：网关 MCU 固件从 v3.1 升级到 v3.2.1",
+   "expect_tools": [
+    "call_impact_agent"
+   ]
+  },
+  {
+   "id": "L0-10",
+   "message": "上次那个黑屏的问题最后是怎么解决的",
+   "expect_tools": [
+    "search_past_diagnoses"
+   ],
+   "expect_not": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-11",
+   "message": "以前 EV 线有没有人遇到过充电跳闸的问题",
+   "expect_tools": [
+    "search_past_diagnoses"
+   ]
+  },
+  {
+   "id": "L0-12",
+   "message": "帮我在 ALM 平台创建一个问题单，标题：中控屏黑屏偶发",
+   "expect_tools": [
+    "call_create_issue"
+   ],
+   "expect_not": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-13",
+   "message": "帮我关联问题单 ISS-2025-00123，基于这个单子诊断",
+   "expect_tools": [
+    "call_link_issue"
+   ]
+  },
+  {
+   "id": "L0-14",
+   "message": "ISS-2025-00123 根因已确认是排线松动，修复完了，建议结案",
+   "expect_tools": [
+    "call_close_issue"
+   ],
+   "expect_not": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-15",
+   "message": "你好，你都能帮我做什么",
+   "expect_none_business": true
+  },
+  {
+   "id": "L0-16",
+   "message": "谢谢，没问题了",
+   "expect_none_business": true
+  },
+  {
+   "id": "L0-17",
+   "message": "新车交付前充电口盖打不开，用户在店里等着",
+   "expect_tools": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-18",
+   "message": "查一下本月 IA 线的故障统计和 Top5 现象",
+   "expect_tools": [
+    "call_operation_agent"
+   ],
+   "expect_not": [
+    "call_knowledge_agent"
+   ]
+  },
+  {
+   "id": "L0-19",
+   "message": "ISO 26262 对功能安全管理有什么要求",
+   "expect_tools": [
+    "call_knowledge_agent"
+   ]
+  },
+  {
+   "id": "L0-20",
+   "message": "车门异响，过减速带的时候更明显，天冷的时候尤其严重",
+   "expect_tools": [
+    "call_triage_agent"
+   ]
+  },
+  {
+   "id": "L0-21",
+   "message": "帮我检查一下这个黑屏故障跟库里已有的问题单是不是重复",
+   "expect_tools": [
+    "call_dedup_check"
+   ],
+   "expect_not": [
+    "call_operation_agent"
+   ]
+  },
+  {
+   "id": "L0-22",
+   "message": "刚才那个建单草稿没问题，确认创建吧",
+   "expect_tools": [
+    "call_confirm_issue"
+   ],
+   "expect_not": [
+    "call_create_issue"
+   ]
+  }
+ ]
+}

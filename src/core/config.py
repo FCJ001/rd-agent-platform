@@ -10,6 +10,7 @@
 # ============================================================
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings
 
@@ -170,6 +171,38 @@ class Settings(BaseSettings):
     # ---------------- ChatBI 独立服务（BI 查询，多数据源平台）----------------
     BI_SVC_URL: str = "http://localhost:8004"
     BI_PROJECT_ID: str = "rd_agent"  # 对应 rd-chatBI 的 bi_datasources.code
+    # 传输方式：http（直连 REST）/ mcp（走 rd-chatBI 的 /mcp MCP 门面）。
+    # 两者业务语义等价（同一条 REST 链路兜底），默认 http 保持原行为。
+    # ★ mcp 传输只带 X-User-* 头，需要 rd-chatBI 跑 AUTH_MODE=header；
+    #   jwt 模式下两条路径都会 fail-closed（缺 token）。
+    BI_TRANSPORT: Literal["http", "mcp"] = "http"
+    BI_MCP_URL: str = ""  # MCP 端点；空则用 f"{BI_SVC_URL}/mcp/"
+
+    # ---------------- 建单草稿（HITL 责任边界）----------------
+    # AI 只出草稿（ai_issue_drafts），用户确认后才真建单。
+    # 草稿超过该秒数未确认 → 惰性置 expired（确认/查询时顺带判，无定时任务）
+    ISSUE_DRAFT_TTL_SECONDS: int = 15 * 60
+
+    # ---------------- P1 单图化（编排图灰度开关）----------------
+    # true = chat 入口用编排图（Supervisor ⇄ 分诊会话子图同图，单一状态源，
+    #   无 TriageSessionStore/无快进空转，src/agents/orchestrator.py）；
+    # false = 旧路径（agent-as-tool + 外部进度存储，完整保留）。
+    # REST /api/v1/triage 与 webhook 自动分诊不受此开关影响（继续走旧引擎）。
+    # 灰度：按业务线/实例翻开关；回退 = 改回 false，存量挂起会话走旧路径
+    # TTL 自然消亡，不迁移数据。
+    SUBGRAPH_TRIAGE_ENABLED: bool = False
+
+    # ---------------- 分诊追问期间的旁路助手（离题分流）----------------
+    # 设计：docs/design-side-assistant-bypass.md。追问挂起时，判定为
+    # 「问别的智能体」的消息不进图，由无状态旁路助手就地回答后回放追问。
+    # ★ 默认 true = 直接上线。两个方向的误判都安全：
+    #   误判为回答 = 旁路上线前的原行为（最坏白烧一轮分诊）；
+    #   误判为旁路 = 多一轮回答 + 追问回放，状态零变动，用户重答即可。
+    #   [SIDE] 日志继续作为线上误判率的监控数据源；
+    #   回退：改 false 即影子模式（判定器照跑只记日志，路由回原行为）。
+    SIDE_ASSISTANT_ENABLED: bool = True
+    # 判定/回答共用的小模型（正则门放行后的裁决 + 旁路助手本体）
+    SIDE_ASSISTANT_MODEL: str = "qwen-flash"
 
     # ---------------- Java ALM 平台（开发期 logger 占位）----------------
     PLATFORM_ALM_URL: str = "https://alm.internal"

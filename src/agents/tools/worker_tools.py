@@ -248,6 +248,9 @@ async def call_report_agent(message: str, report_type: str = "DTC扫描", runtim
     from src.agents.workers.report_agent import get_report_agent
     agent = get_report_agent()
     result = await agent.analyze(message, report_type)
+    # 报告解读来自不可信的原始文本：定界包裹后再进 Supervisor 上下文（注入防护）
+    from src.agents.tools.injection_guard import wrap_untrusted
+    result = wrap_untrusted("report_agent", result)
 
     # 保存到影子表，供反馈回写
     try:

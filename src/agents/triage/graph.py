@@ -19,7 +19,7 @@ from src.agents.triage.db_queries import (
     load_issue_context, match_phenomena_by_names,
     lookup_dtc_codes, save_triage_result,
 )
-from src.agents.triage.graph_queries import query_causes_by_phenomena, enrich_cause_details
+from src.agents.triage.graph_queries import query_causes_by_phenomena, enrich_cause_details_async
 from src.utils.business_line import resolve_business_line
 from src.agents.triage.confidence import (
     apply_context_weights, check_convergence, merge_evidence, MAX_ROUNDS,
@@ -260,7 +260,7 @@ async def node_query_candidates(state: TriageState, deps: TriageDeps) -> dict:
     logger.info(f"[TRIAGE] 节点③ matched_phenomena={phenom_names} neo4j_candidates={len(candidates)}")
 
     if candidates:
-        candidates = await asyncio.to_thread(enrich_cause_details, candidates)
+        candidates = await enrich_cause_details_async(candidates)
 
         candidates = apply_context_weights(
             candidates, state.dtc_codes, state.denied_phenomena,

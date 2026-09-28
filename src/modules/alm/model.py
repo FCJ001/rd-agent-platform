@@ -386,6 +386,38 @@ class AiReportInterpretation(BaseModel):
     )
 
 
+class AiIssueDraft(BaseModel):
+    """问题单草稿 —— AI 只出草稿，人工确认后才真建单（HITL 责任边界）。
+
+    状态机（单向前进，不回退）：
+      pending → submitted  用户确认，已向 ALM 提交（issue_no 回写）
+      pending → expired    超时未确认（惰性判定：确认/查询时顺带置位，
+                            不用定时任务）
+    ★ 确认时按 user_id 做属主校验（IDOR 防护，与反馈接口同款）；
+      仅 pending 可提交 = 幂等（重复确认/重放都被挡）。
+    """
+
+    __tablename__ = "ai_issue_drafts"
+
+    # ★ 行归属：确认时属主校验的依据。NULL = 迁移前存量（不可被任何人确认）
+    user_id: Mapped[int | None] = mapped_column(BigInteger, comment="创建者用户 ID（users.id）")
+    session_id: Mapped[str] = mapped_column(String(100), nullable=False, comment="会话 ID")
+    title: Mapped[str] = mapped_column(String(200), nullable=False, comment="问题标题")
+    description: Mapped[str | None] = mapped_column(Text, comment="问题描述（故障现象、DTC 码等）")
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, comment="严重度：blocker/critical/normal/minor")
+    # 作用域来自用户上下文（runtime.context），LLM 传值只是兜底 —— 作用域不能让模型决定
+    business_line: Mapped[str] = mapped_column(String(10), nullable=False, comment="业务线（作用域）")
+    source: Mapped[str | None] = mapped_column(String(30), comment="来源（创建者角色）")
+    owner_domain_id: Mapped[int | None] = mapped_column(BigInteger, comment="责任域 ID")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", comment="pending/submitted/expired")
+    issue_no: Mapped[str | None] = mapped_column(String(50), comment="提交成功后的平台问题单号")
+
+    __table_args__ = (
+        Index("ix_draft_user", "user_id"),
+        Index("ix_draft_status", "status"),
+    )
+
+
 # ==========================================================
 # ④ 幂等事件日志
 # Webhook / 定时同步的去重依据：同一个 (event_type, entity_type, entity_id, entity_version)

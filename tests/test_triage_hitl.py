@@ -396,3 +396,69 @@ async def test_busy_exception_on_resume_keeps_interrupt_pending():
     tool_msg = [m for m in r3["messages"] if m.type == "tool"][0]
     assert "结论" in tool_msg.content
     assert await store.load("u3:s3") is None
+
+
+async def test_busy_rejected_before_interrupt_uses_new_value_on_retry():
+    """★ 按生产真实顺序（闸门/会话锁在 interrupt 之前）拒绝的契约回归。
+
+    call_triage_agent 的拒绝顺序是 gate → lock → 图逻辑，异常发生在工具
+    消费 resume 值之前（与上一个用例的「消费后抛」形成对照）。锁住：
+      1. 异常穿出 ainvoke，快照仍挂起 interrupt（checkpoint 未前进）；
+      2. ★ 用户重答新值时 interrupt 拿到的是**新值**（旧值未提交）——
+         生产里用户被拒后重发的那句话不会被丢，也不会错位挂到下一个
+         追问上。这是 busy 分流把拒绝放在 interrupt 之前的安全依据，
+         也是离题判定必须发生在图调用之前的同一根因（契约 [E]）。
+    """
+    from src.core.exceptions import TriageSystemBusyError
+
+    redis = StubRedis()
+    store = TriageSessionStore(redis)
+    flags = {"reject_once": True}
+    answers = []
+
+    @tool
+    async def stub_triage(message: str) -> str:
+        """模拟分诊工具：resume 重放时先过闸门（拒一次）再 interrupt。"""
+        saved = await store.load("u4:s4")
+        if saved is None:
+            # 首轮：round-0 工作在 interrupt 之前完成（与真实 worker 一致）
+            await store.save("u4:s4", TriageState(session_id="u4:s4"), "是否黑屏？")
+        else:
+            # resume 重放：★ 拒绝发生在任何 interrupt() 之前（gate/lock 位置）
+            if flags["reject_once"]:
+                flags["reject_once"] = False
+                raise TriageSystemBusyError()
+            for _ in range(saved.state.round):
+                interrupt({"type": "fast-forward"})
+        answer = interrupt({"type": "triage_followup", "question": "是否黑屏？"})
+        answers.append(answer)
+        await store.clear("u4:s4")
+        return f"结论（基于回答：{answer}）"
+
+    model = _make_fake_model([
+        AIMessage(content="", tool_calls=[
+            {"name": "stub_triage", "args": {"message": "车机黑屏"}, "id": "call_1"}
+        ]),
+        AIMessage(content="诊断完成。"),
+    ])
+
+    agent = create_agent(model=model, tools=[stub_triage], system_prompt="test", checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "u4:s4"}}
+
+    # 首轮：round-0 工作完成后挂在追问
+    r1 = await agent.ainvoke({"messages": [{"role": "user", "content": "车机黑屏"}]}, config)
+    assert "__interrupt__" in r1
+
+    # resume 被拒（interrupt 之前）：异常穿出，checkpoint 未前进
+    with pytest.raises(TriageSystemBusyError):
+        await agent.ainvoke(Command(resume="是，重启也没用"), config)
+    snapshot = await agent.aget_state(config)
+    assert any(t.interrupts for t in snapshot.tasks), "checkpoint 前进了，追问被消费"
+    assert await store.load("u4:s4") is not None, "会话进度不能丢"
+
+    # 用户重答了不一样的新值：interrupt 拿到新值，旧值没有残留
+    r3 = await agent.ainvoke(Command(resume="不是黑屏，是花屏"), config)
+    assert answers == ["不是黑屏，是花屏"]
+    tool_msg = [m for m in r3["messages"] if m.type == "tool"][0]
+    assert "花屏" in tool_msg.content
+    assert await store.load("u4:s4") is None

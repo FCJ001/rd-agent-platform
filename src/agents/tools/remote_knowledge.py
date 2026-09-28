@@ -6,6 +6,8 @@ import httpx
 from langchain_core.tools import tool
 from langgraph.prebuilt import ToolRuntime
 
+from src.agents.tools.bi_mcp_bridge import bi_query_via_mcp
+from src.agents.tools.injection_guard import wrap_untrusted
 from src.core.config import get_settings
 from src.core.deps import UserContext
 from src.core.logger import logger
@@ -57,7 +59,9 @@ async def _post_bi(endpoint: str, body: dict, ctx: UserContext, timeout: int = 6
     """ChatBI 服务专用 POST：指向 rd-chatBI + X-Project-Id 数据源路由。"""
     url = f"{settings.BI_SVC_URL}{endpoint}"
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # trust_env=False：内网服务间调用绕开环境/系统代理（macOS 上 httpx 会
+        # 读系统代理却不认 127.0.0.1 例外，本机调试流量会被劫持成 502）
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             resp = await client.post(
                 url, json=body,
                 headers=_auth_headers(ctx, project_id=settings.BI_PROJECT_ID),
@@ -110,7 +114,8 @@ async def call_knowledge_agent(message: str, runtime: ToolRuntime[UserContext]) 
     if channels:
         lines.append(f"\n检索通道：{'、'.join(channels)}")
 
-    return "\n".join(lines)
+    # 远端返回不可信：定界包裹后再进 Supervisor 上下文（注入防护）
+    return wrap_untrusted("knowledge_svc", "\n".join(lines))
 
 
 @tool
@@ -132,7 +137,12 @@ async def call_operation_agent(message: str, runtime: ToolRuntime[UserContext]) 
         "with_chart": False,
     }
 
-    resp = await _post_bi("/api/v1/bi/query", body, ctx)
+    # BI_TRANSPORT 切换传输方式：两条路径业务语义等价（同一套 REST 链路兜底），
+    # 返回形状与三档降级文案对齐（见 bi_mcp_bridge 模块注释），格式化代码共用。
+    if settings.BI_TRANSPORT == "mcp":
+        resp = await bi_query_via_mcp(message, body["session_id"], ctx)
+    else:
+        resp = await _post_bi("/api/v1/bi/query", body, ctx)
     if "error" in resp:
         return resp["error"]
 
@@ -144,7 +154,9 @@ async def call_operation_agent(message: str, runtime: ToolRuntime[UserContext]) 
     row_count = data.get("row_count", 0)
 
     if not success:
-        return f"查询失败：{data.get('error') or summary[:200]}"
+        # 业务异常（BizException）走 HTTP 200 + code!=200，data 为 None ——
+        # 此时错误原因在响应顶层的 message 里，不兜底会输出空的「查询失败：」
+        return f"查询失败：{data.get('error') or resp.get('message') or summary[:200]}"
 
     lines = [summary]
 
@@ -157,7 +169,8 @@ async def call_operation_agent(message: str, runtime: ToolRuntime[UserContext]) 
     if sql:
         lines.append(f"\n*查询 SQL：{sql}*")
 
-    return "\n".join(lines)
+    # BI 数据来自远端：定界包裹（注入防护；错误文案是本服务生成的，不包）
+    return wrap_untrusted("chatbi", "\n".join(lines))
 
 
 REMOTE_TOOLS = [call_knowledge_agent, call_operation_agent]

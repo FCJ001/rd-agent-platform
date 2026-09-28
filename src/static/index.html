@@ -269,6 +269,9 @@ body {
 /* Responsive */
 @media (max-width:1100px) { .context { display:none; } }
 @media (max-width:700px)  { .sidebar { display:none; } }
+.triage-jump{margin-left:auto;flex-shrink:0;border:1px solid rgba(37,99,235,.45);background:#fff;color:#2563eb;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer}
+.triage-jump:hover{background:#2563eb;color:#fff}
+.triage-banner{display:flex;align-items:center;gap:6px;margin:10px 16px;padding:8px 12px;border-radius:8px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.35);color:#2563eb;font-size:13px;line-height:1.4}
 </style>
 </head>
 <body>
@@ -339,6 +342,11 @@ body {
             </div>
           </div>
         </div>
+        <div id="triageBanner" class="triage-banner" style="display:none">
+          🩺 诊断进行中 —— 回答上面的追问，或直接提新问题（会自动转给对应助手）
+          <span style="opacity:.75">｜回复「退出诊断」可结束</span>
+          <button class="triage-jump" onclick="parkAndNewSession()">去办其他事，保留本诊断 →</button>
+        </div>
         <div id="messages"></div>
       </div>
     </div>
@@ -388,6 +396,9 @@ function init() {
   checkHealth();
   restoreOrWelcome();
   renderSessionList();
+  // 启动恢复：上个会话若还有挂起的追问，横幅和输入框提示直接就位
+  const s0 = store.sessions.find(x=>x.id===store.activeSid);
+  if (s0 && s0.triagePending) setTriagePending(true);
 }
 function checkHealth() {
   fetch(BASE+'/health').then(r=>r.json()).then(d=>{
@@ -418,9 +429,17 @@ function newSession() {
   store.activeSid = sid;
   store.history = [];
   store.triageState = null;
+  setTriagePending(false);   // activeSid 已指向新会话：旧会话的挂起标记原样保留
   persist();
   render();
+  renderSessionList();
   document.getElementById('userInput').focus();
+}
+
+/* 挂起当前诊断去办其他事：诊断在服务端原样保留（checkpointer 活着、不占
+   并发额度），新会话里并行处理别的需求；从会话列表点回来即可续答追问。 */
+function parkAndNewSession() {
+  newSession();
 }
 
 function switchSession(sid) {
@@ -428,13 +447,17 @@ function switchSession(sid) {
   const s = store.sessions.find(x=>x.id===sid);
   store.history = s ? (s.messages||[]) : [];
   store.triageState = null;
+  setTriagePending(!!(s && s.triagePending));   // 该会话还有挂起的追问 → 横幅恢复
   persist();
   render();
 }
 
 function deleteSession(sid) {
   store.sessions = store.sessions.filter(x=>x.id!==sid);
-  if (store.activeSid === sid) { store.activeSid=''; store.history=null; store.triageState=null; }
+  if (store.activeSid === sid) {
+    store.activeSid=''; store.history=null; store.triageState=null;
+    setTriagePending(false);   // activeSid 已空：只清 UI，不误伤其他会话的挂起标记
+  }
   persist();
   render();
 }
@@ -490,6 +513,20 @@ async function errFromResp(resp) {
     if (j && j.code) code = j.code;
   } catch(e){}
   return {msg, code};
+}
+
+/* 诊断进行中状态：done 帧的 triage_pending 驱动横幅 + 输入框提示语 */
+const INPUT_PLACEHOLDER_DEFAULT = '输入故障现象、变更描述、报告内容…';
+const INPUT_PLACEHOLDER_TRIAGE = '回答上面的诊断问题，或直接提新问题（会自动转给对应助手）…';
+function setTriagePending(flag) {
+  const b = document.getElementById('triageBanner');
+  const input = document.getElementById('userInput');
+  if (b) b.style.display = flag ? 'flex' : 'none';
+  if (input) input.placeholder = flag ? INPUT_PLACEHOLDER_TRIAGE : INPUT_PLACEHOLDER_DEFAULT;
+  // 会话级持久化：挂起状态记在会话对象上，切走再切回来横幅能恢复
+  // （activeSid 为空 = 删除激活会话后的清理，只清 UI 不写任何会话）
+  const s = store.sessions.find(x=>x.id===store.activeSid);
+  if (s && !!s.triagePending !== !!flag) { s.triagePending = !!flag; persist(); }
 }
 
 /* 把助手占位气泡替换为「排队提示 + 重试按钮」。
@@ -560,7 +597,7 @@ async function send(msg, opts) {
           if (isBusyCode(d.code)) busyMsg = d.message;
           else { full = '⚠️ ' + d.message; updateBubble(placeholder, full); }
         },
-        onDone: () => {}
+        onDone: d => { if (d && typeof d.triage_pending !== 'undefined') setTriagePending(!!d.triage_pending); }
       });
     }
   } catch(e) {
@@ -718,7 +755,7 @@ async function sendActionReply(msg) {
           if (isBusyCode(d.code)) busyMsg = d.message;
           else { full = '⚠️ ' + d.message; updateBubble(placeholder, full); }
         },
-        onDone: () => {}
+        onDone: d => { if (d && typeof d.triage_pending !== 'undefined') setTriagePending(!!d.triage_pending); }
       });
     }
   }catch(e){ full='⚠️ 请求失败: '+e.message; updateBubble(placeholder, full); }
@@ -825,8 +862,8 @@ function renderSessionList() {
       html += `<div class="session-item${isActive?' active':''}" onclick="switchSession('${s.id}')">
         <div class="si-dot ${dotClass}"></div>
         <div class="si-info">
-          <div class="si-title">${esc(s.title)}</div>
-          <div class="si-meta">${timeAgo(s.createdAt)} · ${s.messages?.length||0} 条消息</div>
+          <div class="si-title">${s.triagePending ? '🩺 ' : ''}${esc(s.title)}</div>
+          <div class="si-meta">${timeAgo(s.createdAt)} · ${s.messages?.length||0} 条消息${s.triagePending ? ' · 诊断挂起中' : ''}</div>
         </div>
         <button class="icon-btn" style="font-size:12px;opacity:0" onclick="event.stopPropagation();deleteSession('${s.id}')" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0'">🗑</button>
       </div>`;

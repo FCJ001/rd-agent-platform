@@ -4,6 +4,8 @@
   从 async 节点调用时必须 `asyncio.to_thread(...)` 包装（见 graph.py 节点③）。
 """
 
+import asyncio
+
 from src.core.logger import logger
 from src.agents.triage.state import CandidateCause
 from src.infra.neo4j_client import get_neo4j_driver
@@ -80,79 +82,61 @@ def query_causes_by_phenomena(
     return candidates
 
 
-def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCause]:
-    """补充候选根因的全部现象、验证项、is_core 信息（批量查询）。"""
-    if not candidates:
-        return candidates
-
+def _enrich_part_phenom_domain(candidates: list[CandidateCause]) -> dict:
+    """富化①：批量查全部现象（is_core/weight）与责任域。"""
     cause_codes = [c.code for c in candidates]
     driver = get_neo4j_driver()
-
-    # 批量查全部现象 + is_core/weight
     phenom_cypher = """
     MATCH (rc:RootCause)-[r:INDICATES]->(ph:Phenomenon)
     WHERE rc.code IN $codes
     RETURN rc.code AS code, collect({name: ph.name, is_core: r.is_core, weight: r.weight}) AS phenomena
     """
-    # 批量查责任域
     domain_cypher = """
     MATCH (rc:RootCause)-[:BELONGS_TO]->(od:OwnerDomain)
     WHERE rc.code IN $codes
     RETURN rc.code AS code, od.name AS domain
     """
-
     with driver.session() as session:
-        phenom_result = session.run(phenom_cypher, codes=cause_codes)
-        phenom_map = {r["code"]: r["phenomena"] for r in phenom_result}
+        phenom_map = {r["code"]: r["phenomena"] for r in session.run(phenom_cypher, codes=cause_codes)}
+        domain_map = {r["code"]: r["domain"] for r in session.run(domain_cypher, codes=cause_codes)}
+    return {"phenom": phenom_map, "domain": domain_map}
 
-        domain_result = session.run(domain_cypher, codes=cause_codes)
-        domain_map = {r["code"]: r["domain"] for r in domain_result}
 
-    for c in candidates:
-        all_ph = phenom_map.get(c.code, [])
-        c.all_phenomena = [p["name"] for p in all_ph]
-        # 现象名 → INDICATES.weight（反馈回写实时值），置信度评分用作证据调制（C1）
-        c.phenomena_weight = {
-            p["name"]: float(p.get("weight") or 0.0) for p in all_ph if p.get("weight") is not None
-        }
-        c.is_core_match = any(
-            p["is_core"] and p["name"] in c.matched_phenomena
-            for p in all_ph
-        )
-        c.domain = domain_map.get(c.code, c.domain)
-
-    # Load dtc codes from Neo4j (stored as rc.dtc list on RootCause nodes)
-    dtc_cypher = """
+def _enrich_part_dtc(candidates: list[CandidateCause]) -> dict[str, list[str]]:
+    """富化②：根因的 DTC 列表（rc.dtc 属性）。失败返回空（可选项）。"""
+    cause_codes = [c.code for c in candidates]
+    driver = get_neo4j_driver()
+    cypher = """
     MATCH (rc:RootCause)
     WHERE rc.code IN $codes AND rc.dtc IS NOT NULL
     RETURN rc.code AS code, rc.dtc AS dtc
     """
     try:
         with driver.session() as session:
-            dtc_result = session.run(dtc_cypher, codes=cause_codes)
             dtc_map = {}
-            for r in dtc_result:
+            for r in session.run(cypher, codes=cause_codes):
                 dtc_val = r["dtc"]
                 if isinstance(dtc_val, list):
                     dtc_map[r["code"]] = dtc_val
                 elif isinstance(dtc_val, str):
                     dtc_map[r["code"]] = [x.strip() for x in dtc_val.split(",") if x.strip()]
-            for c in candidates:
-                c.dtc_matched = dtc_map.get(c.code, [])
+            return dtc_map
     except Exception:
-        pass  # dtc matching is optional
+        return {}
 
-    # Load verify_items from PostgreSQL (batch query via psycopg2)
+
+def _enrich_part_verify_items(candidates: list[CandidateCause]) -> dict[str, str]:
+    """富化③：验证项（PG，root_causes 受 RLS 管控须带作用域）。失败返回空。"""
+    cause_codes = [c.code for c in candidates]
     try:
         import psycopg2
         from src.core.config import get_settings
         from src.infra.pg_scope import apply_scope
-        s = get_settings()
+        s_ = get_settings()
         conn = psycopg2.connect(
-            host=s.DB_HOST, port=s.DB_PORT,
-            user=s.DB_USER, password=s.DB_PASSWORD, dbname=s.DB_NAME,
+            host=s_.DB_HOST, port=s_.DB_PORT,
+            user=s_.DB_USER, password=s_.DB_PASSWORD, dbname=s_.DB_NAME,
         )
-        # root_causes 受 RLS 管控：不带作用域会静默查空（verify_items 消失）
         apply_scope(conn)
         try:
             cur = conn.cursor()
@@ -165,33 +149,79 @@ def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCaus
             cur.close()
         finally:
             conn.close()
-        for c in candidates:
-            if c.code in rows:
-                c.verify_items = rows[c.code] or ""
+        return rows
     except Exception as e:
         logger.warning(f"[GRAPH-QUERIES] verify_items 富化失败（可选项）: {e}")
+        return {}
 
-    # Load LOCATED_IN relationships from Neo4j
-    try:
-        located_in = query_located_in(cause_codes)
-        for c in candidates:
-            if c.code in located_in:
-                c.related_config_items = located_in[c.code]
-    except Exception:
-        pass
 
-    # Load CO_OCCURS_WITH relationships from Neo4j
-    try:
-        co_occurs = query_co_occurs_with(cause_codes)
-        for c in candidates:
-            if c.code in co_occurs:
-                c.related_causes = [
-                    f"{r['name']}({r['domain']})" for r in co_occurs[c.code]
-                ]
-    except Exception:
-        pass
+def _enrich_part_located_in(cause_codes: list[str]) -> dict[str, list[dict]]:
+    return query_located_in(cause_codes)
 
+
+def _enrich_part_co_occurs(cause_codes: list[str]) -> dict[str, list[dict]]:
+    return query_co_occurs_with(cause_codes)
+
+
+def _apply_enrich_parts(
+    candidates: list[CandidateCause], pd: dict, dtc_map: dict,
+    verify_map: dict, located_in: dict, co_occurs: dict,
+) -> list[CandidateCause]:
+    """把五个富化部分的结果合并回候选（纯函数，sync/async 版共用）。"""
+    phenom_map, domain_map = pd["phenom"], pd["domain"]
+    for c in candidates:
+        all_ph = phenom_map.get(c.code, [])
+        c.all_phenomena = [p["name"] for p in all_ph]
+        # 现象名 → INDICATES.weight（反馈回写实时值），置信度评分用作证据调制（C1）
+        c.phenomena_weight = {
+            p["name"]: float(p.get("weight") or 0.0) for p in all_ph if p.get("weight") is not None
+        }
+        c.is_core_match = any(
+            p["is_core"] and p["name"] in c.matched_phenomena for p in all_ph
+        )
+        c.domain = domain_map.get(c.code, c.domain)
+        c.dtc_matched = dtc_map.get(c.code, [])
+        if c.code in verify_map:
+            c.verify_items = verify_map[c.code] or ""
+        if c.code in located_in:
+            c.related_config_items = located_in[c.code]
+        if c.code in co_occurs:
+            c.related_causes = [f"{r['name']}({r['domain']})" for r in co_occurs[c.code]]
     return candidates
+
+
+def enrich_cause_details(candidates: list[CandidateCause]) -> list[CandidateCause]:
+    """补充候选根因详情（串行版，兼容旧调用方）。"""
+    if not candidates:
+        return candidates
+    codes = [c.code for c in candidates]
+    return _apply_enrich_parts(
+        candidates,
+        _enrich_part_phenom_domain(candidates),
+        _enrich_part_dtc(candidates),
+        _enrich_part_verify_items(candidates),
+        _enrich_part_located_in(codes),
+        _enrich_part_co_occurs(codes),
+    )
+
+
+async def enrich_cause_details_async(candidates: list[CandidateCause]) -> list[CandidateCause]:
+    """并行版：五个富化查询相互独立，gather 并行。
+
+    原串行实现 = 5 次顺序往返（Neo4j×3 + PG×1 + 关系查询×1）；
+    并行后耗时 ≈ 最长一路。分诊节点③的固定开销从"5 跳"压到"1 跳"。
+    """
+    if not candidates:
+        return candidates
+    codes = [c.code for c in candidates]
+    pd, dtc_map, verify_map, located_in, co_occurs = await asyncio.gather(
+        asyncio.to_thread(_enrich_part_phenom_domain, candidates),
+        asyncio.to_thread(_enrich_part_dtc, candidates),
+        asyncio.to_thread(_enrich_part_verify_items, candidates),
+        asyncio.to_thread(_enrich_part_located_in, codes),
+        asyncio.to_thread(_enrich_part_co_occurs, codes),
+    )
+    return _apply_enrich_parts(candidates, pd, dtc_map, verify_map, located_in, co_occurs)
 
 
 # ════════════════════════════════════════════════════════════════════════

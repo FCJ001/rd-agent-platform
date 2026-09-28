@@ -1,5 +1,5 @@
 {
- "description": "L1-L5 端到端实况场景：手工 20 + 图谱批量生成 15（断言由真实图谱+评分代码仿真标定）",
+ "description": "L1-L6 端到端实况场景（L6=追问期间离题注入）：手工 20 + 图谱批量生成 15（断言由真实图谱+评分代码仿真标定）",
  "cases": [
   {
    "id": "L1-01",
@@ -1238,6 +1238,39 @@
    "expect_denied_nonempty": true,
    "expect_cause": [
     "RC-IA-0081"
+   ],
+   "expect_converged": false
+  },
+  {
+   "id": "L6-01",
+   "layer": "L6",
+   "title": "追问期间注入离题消息：现象集不被污染，补答后仍收敛",
+   "turns": [
+    "车机屏幕最近总觉得不对劲",
+    "帮我查一下这个月 EV 线的故障统计",
+    "屏幕花屏还死机，触摸有时候也没反应，语音助手也唤不醒"
+   ],
+   "expect_phenomena": [
+    "中控屏",
+    "语音"
+   ],
+   "expect_cause": [
+    "RC-IA-0001",
+    "RC-IA-0002"
+   ],
+   "expect_converged": true
+  },
+  {
+   "id": "L6-02",
+   "layer": "L6",
+   "title": "追问期间注入概念性离题消息后继续作答：不误收敛",
+   "turns": [
+    "中控屏经常黑屏，重启之后又恢复正常了",
+    "DTC 码是什么意思",
+    "没有其他现象了，就这些"
+   ],
+   "expect_phenomena": [
+    "中控屏"
    ],
    "expect_converged": false
   }
