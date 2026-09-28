@@ -54,6 +54,10 @@ langgraph-checkpoint==4.0.1
 langgraph-prebuilt==1.0.9
 dashscope==1.25.16
 
+# ---------------- MCP 客户端（BI_TRANSPORT=mcp 时走 rd-chatBI 的 /mcp）--------
+# 1.30+ 才自带同源重定向跟随（/mcp → /mcp/ 的 307）；2.x 改了客户端 API，锁 1.x
+mcp>=1.30,<2
+
 # ---------------- MinIO + 报告解析（步 6）----------------
 minio==7.2.18
 pypdf==6.10.0

@@ -36,6 +36,10 @@
 #   代价要说清：续租之后「进程假死但仍存活」的持有者不再被 TTL 兜底，
 #   该会话会一直忙到进程真正退出。两者相权取续租 —— 互斥失效写坏的是
 #   数据（不可逆），假死只是暂时进不去（可逆），且日志有迹可循。
+# ★ 锁易主必须中止本回合（fencing 的最小实现）：确认锁已不属于自己时，
+#   取消持有它的那个任务，而不是「停止续租、临界区继续跑」——后者等于
+#   互斥已破、双方同时写状态且毫无感知，正是这把锁要防的事故本身。
+#   中止的代价是本回合作废（用户重发一次），比写坏 checkpoint 便宜得多。
 # ============================================================
 
 from __future__ import annotations
@@ -195,11 +199,17 @@ async def _renew_loop(
     prefix: str,
     ttl_seconds: float | None,
     stop: asyncio.Event,
+    holder: asyncio.Task | None = None,
 ) -> None:
     """持有期间按 TTL 的 1/3 周期续租，直到 stop 或锁被回收。
 
     周期取 TTL 的 1/3：连续错过两次续租（Redis 抖动）才会被判过期。
     ★ 不设周期下限 —— 周期一旦 ≥ TTL，续租就永远追不上过期。
+
+    网络抖动（Redis 异常）不退出：下一周期重试即可，空位此时仍归我们。
+    确认锁被回收（renew 返回 False）则不再只是停止续租——同时取消持有
+    本锁的任务（fencing）：锁已易主，继续跑临界区 = 双方并发写同一份
+    会话状态，正是这把锁要防的事故。宁可本回合作废，不可双写。
     """
     interval = _ttl(ttl_seconds) / 3
     while True:
@@ -217,6 +227,11 @@ async def _renew_loop(
             continue
         if not alive:
             logger.warning(f"[TRIAGE-LOCK] 锁已易主或过期，停止续租 thread={thread_id}")
+            if holder is not None and not holder.done():
+                logger.warning(
+                    f"[TRIAGE-LOCK] fencing：中止持有已丢失锁的临界区 thread={thread_id}"
+                )
+                holder.cancel()
             return
 
 
@@ -260,7 +275,10 @@ async def session_lock(
     renew_task = None
     if keep_alive:
         renew_task = asyncio.create_task(
-            _renew_loop(thread_id, token, redis_client, prefix, ttl_seconds, stop)
+            _renew_loop(
+                thread_id, token, redis_client, prefix, ttl_seconds, stop,
+                holder=asyncio.current_task(),
+            )
         )
 
     try:

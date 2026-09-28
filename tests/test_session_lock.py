@@ -34,14 +34,18 @@ class FakeRedis:
         self.store[key] = value
         return True
 
-    async def eval(self, script, numkeys, key, arg):
+    async def eval(self, script, numkeys, key, *args):
         if self.raise_on_eval:
             raise ConnectionError("redis down")
-        # 复刻 Lua CAS 语义：token 对得上才删
-        if self.store.get(key) == arg:
-            del self.store[key]
+        # 复刻两段 Lua 的 CAS 语义（按参数个数区分调用方）：
+        #   _LUA_RELEASE(key, token)：token 对得上才删
+        #   _LUA_RENEW(key, token, ttl_ms)：token 对得上才续（fake 无 TTL）
+        if self.store.get(key) != args[0]:
+            return 0
+        if len(args) >= 2:  # renew：确认归属即可，不删 key
             return 1
-        return 0
+        del self.store[key]
+        return 1
 
 
 @pytest.fixture(autouse=True)
@@ -198,3 +202,30 @@ async def test_session_lock_serializes_within_process():
     # 无论谁先，进出必须成对相邻 —— 交错（a-in, b-in）就是没锁住
     assert order in (["a-in", "a-out", "b-in", "b-out"],
                      ["b-in", "b-out", "a-in", "a-out"]), order
+
+
+async def test_lock_lost_aborts_holder(monkeypatch):
+    """fencing：确认锁易主后必须中止持有它的临界区，而不是继续跑。
+
+    锁易主意味着另一请求已在同一会话上推进 —— 继续执行 = 双方并发写
+    同一份会话状态，正是这把锁要防的事故。宁可本回合作废，不可双写。
+    """
+    monkeypatch.setattr(lk.settings, "TRIAGE_LOCK_TIMEOUT_SECONDS", 0.3)  # 续租周期 0.1s
+    monkeypatch.setattr(lk.settings, "TRIAGE_LOCK_RETRY_TIMES", 0)
+    fake = FakeRedis()
+    inside = asyncio.Event()
+
+    async def worker():
+        async with lk.session_lock("u1:s1", fake):
+            inside.set()
+            await asyncio.sleep(5)  # 模拟长回合：应被取消，而不是跑完
+            return "finished"       # 若执行到这里说明 fencing 没生效
+
+    task = asyncio.create_task(worker())
+    await asyncio.wait_for(inside.wait(), timeout=2)
+    fake.store.pop("triage_lock:u1:s1")  # 模拟 TTL 到期后被他人抢走
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=3)
+    # 中止路径上锁的善后必须照常完成（释放是空操作，但不许卡死/漏删内层锁）
+    assert lk._thread_locks == {}

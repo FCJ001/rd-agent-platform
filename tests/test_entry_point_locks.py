@@ -217,11 +217,17 @@ async def test_lock_renewed_while_held(monkeypatch, fake_redis):
 
 
 async def test_renew_stops_after_lock_taken_over(monkeypatch, fake_redis):
-    """锁易主后必须停止续租，且绝不替新持有者续期。"""
+    """锁易主后必须停止续租，且绝不替新持有者续期。
+
+    ★ fencing（lock._renew_loop 新语义）：确认易主后还会中止持有该锁的
+      临界区（CancelledError 弹出），而不是「停止续租但继续跑」——
+      继续跑 = 双方并发写同一会话状态，正是锁要防的事故。
+    """
     monkeypatch.setattr(lk.settings, "TRIAGE_LOCK_TIMEOUT_SECONDS", 0.09)
-    async with lk.session_lock("7:s1"):
-        fake_redis.store["triage_lock:7:s1"] = "new-holder"  # 模拟被抢走
-        await asyncio.sleep(0.12)
+    with pytest.raises(asyncio.CancelledError):
+        async with lk.session_lock("7:s1"):
+            fake_redis.store["triage_lock:7:s1"] = "new-holder"  # 模拟被抢走
+            await asyncio.sleep(0.12)
 
     assert all(tok != "new-holder" for _, tok in fake_redis.renew_calls), "替别人续租了"
     assert len(fake_redis.renew_calls) <= 1, "发现自己被踢出后仍在续租"
@@ -243,6 +249,8 @@ async def test_chat_rejects_concurrent_request_same_session(monkeypatch, fake_re
         return agent
 
     monkeypatch.setattr(chat_mod, "get_supervisor_agent", _get_agent)
+    # 钉住编排图开关：.env 灰度翻开后测试也读 .env，不钉会绕过 fake agent
+    monkeypatch.setattr(chat_mod.settings, "SUBGRAPH_TRIAGE_ENABLED", False)
 
     results = await asyncio.gather(
         chat_mod.chat(CHAT_REQ, USER, None),
@@ -267,6 +275,8 @@ async def test_chat_stream_rejects_concurrent_request(monkeypatch, fake_redis):
         return agent
 
     monkeypatch.setattr(chat_mod, "get_supervisor_agent", _get_agent)
+    # 钉住编排图开关：.env 灰度翻开后测试也读 .env，不钉会绕过 fake agent
+    monkeypatch.setattr(chat_mod.settings, "SUBGRAPH_TRIAGE_ENABLED", False)
 
     async with lk.session_lock("7:s1", prefix=lk.CHAT_LOCK_PREFIX):
         resp = await chat_mod.chat_stream(CHAT_REQ, USER, None)
@@ -289,6 +299,8 @@ async def test_chat_stream_releases_lock_on_client_disconnect(monkeypatch, fake_
         return agent
 
     monkeypatch.setattr(chat_mod, "get_supervisor_agent", _get_agent)
+    # 钉住编排图开关：.env 灰度翻开后测试也读 .env，不钉会绕过 fake agent
+    monkeypatch.setattr(chat_mod.settings, "SUBGRAPH_TRIAGE_ENABLED", False)
 
     resp = await chat_mod.chat_stream(CHAT_REQ, USER, None)
     agen = resp.body_iterator
